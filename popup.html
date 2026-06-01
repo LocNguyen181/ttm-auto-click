@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTM Helper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="logo-area">
+        <div class="glow-dot"></div>
+        <h1>TTM Helper</h1>
+      </div>
+      <label class="status-switch" title="Toggle automation">
+        <span id="statusText">Inactive</span>
+        <span class="switch">
+          <input type="checkbox" id="activeToggle">
+          <span class="slider"></span>
+        </span>
+      </label>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="form-group">
+      <label for="targetUrl">Target URL</label>
+      <input type="text" id="targetUrl" placeholder="https://www.thaiticketmajor.com/..." autocomplete="off">
+    </div>
+
+    <!-- Date and Time Filters -->
+    <div class="form-row">
+      <div class="form-group half">
+        <label for="targetDate">Target Date</label>
+        <input type="text" id="targetDate" placeholder="dd/mm" autocomplete="off">
+      </div>
+      <div class="form-group half">
+        <label for="targetTime">Target Time</label>
+        <input type="text" id="targetTime" placeholder="e.g. 17:00" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="toggles-grid">
+      <div class="toggle-card">
+        <div class="toggle-info">
+          <span class="toggle-title">Auto Navigate</span>
+          <span class="toggle-desc">Redirect to Target URL</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="autoNavigate">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="toggle-card">
+        <div class="toggle-info">
+          <span class="toggle-title">Auto Click</span>
+          <span class="toggle-desc">Click matching elements</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="autoClick">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Advanced Settings (Always Expanded) -->
+    <div class="advanced-panel">
+      <div class="panel-header">Advanced Settings</div>
+      
+      <div class="form-group margin-top-xs zone-priority-section">
+        <div class="label-row">
+          <label>Zone Priority (Max 4)</label>
+          <button id="scanZonesBtn" class="btn-text">Scan Page Zones</button>
+        </div>
+        <div id="zoneChoices" class="zone-tag-input" aria-label="Zone priority tags">
+          <input type="text" id="zonePriorityInput" placeholder="Type zone and press Enter" autocomplete="off">
+        </div>
+        <span class="help-text">Enter up to 4 zones. If none are available, auto-selects the nearest available zone.</span>
+      </div>
+
+      <!-- Scanned Zones status (Hidden by default) -->
+      <div id="scannedZonesContainer" class="scanned-zones-list" style="display: none;"></div>
+
+      <div class="form-group">
+        <label for="seatSelector">Seat Row Priority List</label>
+        <input type="text" id="seatSelector" placeholder="AA, A, B" autocomplete="off">
+        <span class="help-text">Selects the first available seat in priority rows.</span>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span>ThaiTicketMajor Helper v1.0</span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
