@@ -1,15 +1,20 @@
 document.addEventListener('DOMContentLoaded', () => {
+  const ZONE_CLICK_LOGS_KEY = 'ttmHelperZoneClickLogs';
+  const LAST_ZONE_CLICK_AT_KEY = 'ttmHelperLastZoneClickAt';
   const targetUrlInput = document.getElementById('targetUrl');
   const targetDateInput = document.getElementById('targetDate');
   const targetTimeInput = document.getElementById('targetTime');
   const zoneChoicesContainer = document.getElementById('zoneChoices');
   const zonePriorityInput = document.getElementById('zonePriorityInput');
   const seatSelectorInput = document.getElementById('seatSelector');
+  const excludedZonesInput = document.getElementById('excludedZones');
+  const excludedSeatsInput = document.getElementById('excludedSeats');
   
   const autoNavigateCheckbox = document.getElementById('autoNavigate');
   const autoClickCheckbox = document.getElementById('autoClick');
   const activeToggle = document.getElementById('activeToggle');
   const statusText = document.getElementById('statusText');
+  const downloadLogsBtn = document.getElementById('downloadLogsBtn');
 
   const scanZonesBtn = document.getElementById('scanZonesBtn');
   const scannedZonesContainer = document.getElementById('scannedZonesContainer');
@@ -51,6 +56,8 @@ document.addEventListener('DOMContentLoaded', () => {
       'zoneSelector',
       'scannedZones',
       'seatSelector',
+      'excludedZones',
+      'excludedSeats',
       'autoNavigate', 
       'autoClick'
     ],
@@ -61,10 +68,11 @@ document.addEventListener('DOMContentLoaded', () => {
       targetTimeInput.value = result.targetTime || '';
       scannedZones = filterZoneList(result.scannedZones);
       selectedZones = filterZoneList((result.zoneSelector || '').split(','))
-        .map(zone => zone.toUpperCase() === 'VIP' ? 'VIP' : zone.toUpperCase())
-        .slice(0, 4);
+        .map(zone => zone.toUpperCase() === 'VIP' ? 'VIP' : zone.toUpperCase());
       renderZoneTags();
       seatSelectorInput.value = result.seatSelector || '';
+      excludedZonesInput.value = result.excludedZones || '';
+      excludedSeatsInput.value = result.excludedSeats || '';
       
       autoNavigateCheckbox.checked = result.autoNavigate !== false;
       autoClickCheckbox.checked = result.autoClick !== false;
@@ -92,6 +100,8 @@ document.addEventListener('DOMContentLoaded', () => {
       zoneSelector: selectedZones.join(', '),
       scannedZones,
       seatSelector: seatSelectorInput.value.trim(),
+      excludedZones: excludedZonesInput.value.trim(),
+      excludedSeats: excludedSeatsInput.value.trim(),
       autoNavigate: autoNavigateCheckbox.checked,
       autoClick: autoClickCheckbox.checked,
     });
@@ -102,7 +112,9 @@ document.addEventListener('DOMContentLoaded', () => {
     targetUrlInput, 
     targetDateInput, 
     targetTimeInput, 
-    seatSelectorInput
+    seatSelectorInput,
+    excludedZonesInput,
+    excludedSeatsInput
   ];
   inputsToSave.forEach(input => input.addEventListener('input', saveSettings));
 
@@ -110,6 +122,7 @@ document.addEventListener('DOMContentLoaded', () => {
   autoClickCheckbox.addEventListener('change', saveSettings);
 
   function setActive(nextIsActive) {
+    const wasActive = isActive;
     isActive = nextIsActive;
     chrome.storage.local.set({ isActive }, () => {
       updateUI();
@@ -120,11 +133,82 @@ document.addEventListener('DOMContentLoaded', () => {
             chrome.tabs.update(tabs[0].id, { url: targetUrlInput.value.trim() });
           }
         });
+      } else if (wasActive && !isActive) {
+        downloadStoredZoneLogs();
       }
     });
   }
 
+  function downloadLogsFromActiveTab() {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      if (!tab?.id) {
+        downloadStoredZoneLogs();
+        return;
+      }
+
+      chrome.tabs.sendMessage(tab.id, { type: 'downloadLogs' }, (response) => {
+        if (chrome.runtime.lastError || !response?.ok || response.logCount === 0) {
+          downloadStoredZoneLogs();
+        }
+      });
+    });
+  }
+
+  function downloadStoredZoneLogs() {
+    chrome.storage.local.get([ZONE_CLICK_LOGS_KEY], (result) => {
+      const entries = Array.isArray(result[ZONE_CLICK_LOGS_KEY]) ? result[ZONE_CLICK_LOGS_KEY] : [];
+      const lines = [
+        'TTM Helper Zone Log',
+        `generated_at=${new Date().toISOString()}`,
+        `entries=${entries.length}`,
+        ''
+      ];
+
+      entries.forEach((entry, index) => {
+        lines.push(
+          `${index + 1}. at=${entry.at || ''} | zone=${entry.zone || 'unknown'} | status=${entry.status || 'unknown'} | since_prev_ms=${entry.sincePrevMs == null ? 'first-click' : entry.sincePrevMs} | script_instance=${entry.scriptInstanceId || ''} | page_type=${entry.pageType || ''} | ready_state=${entry.readyState || ''} | next_action=${entry.nextAction || ''} | click_result=${entry.clickResult || ''} | url=${entry.url || ''} | details=${formatZoneLogDetails(entry)}`
+        );
+      });
+
+      if (entries.length === 0) {
+        lines.push('No zone click logs recorded in this session.');
+      }
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = objectUrl;
+      link.download = `ttm-helper-zone-log-${timestamp}.log`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+
+    });
+  }
+
+  function formatZoneLogDetails(entry) {
+    const hiddenKeys = new Set([
+      'at',
+      'zone',
+      'status',
+      'sincePrevMs',
+      'scriptInstanceId',
+      'url',
+      'pageType',
+      'readyState',
+      'nextAction',
+      'clickResult'
+    ]);
+    const details = {};
+    Object.keys(entry || {}).forEach(key => {
+      if (!hiddenKeys.has(key)) details[key] = entry[key];
+    });
+    return Object.keys(details).length > 0 ? JSON.stringify(details) : '';
+  }
+
   activeToggle.addEventListener('change', () => setActive(activeToggle.checked));
+  downloadLogsBtn.addEventListener('click', downloadLogsFromActiveTab);
 
   // Scan Zones from active tab
   scanZonesBtn.addEventListener('click', () => scanPageZones(false));
@@ -289,8 +373,8 @@ document.addEventListener('DOMContentLoaded', () => {
       zoneChoicesContainer.insertBefore(tag, zonePriorityInput);
     });
 
-    zonePriorityInput.disabled = selectedZones.length >= 4;
-    zonePriorityInput.placeholder = selectedZones.length >= 4 ? 'Max 4 zones' : 'Type zone and press Enter';
+    zonePriorityInput.disabled = false;
+    zonePriorityInput.placeholder = 'Type zone and press Enter';
   }
 
   function addZoneTagsFromText(text) {
@@ -301,7 +385,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     zones.forEach(zone => {
-      if (selectedZones.length >= 4) return;
       if (selectedZones.some(item => item.toLowerCase() === zone.toLowerCase())) return;
       selectedZones.push(zone.toUpperCase() === 'VIP' ? 'VIP' : zone.toUpperCase());
     });

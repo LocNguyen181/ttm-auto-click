@@ -71,16 +71,26 @@
     <!-- Advanced Settings (Always Expanded) -->
     <div class="advanced-panel">
       <div class="panel-header">Advanced Settings</div>
+      <div class="selection-legend" aria-label="Selection legend">
+        <div class="legend-item legend-item-accept">
+          <span class="legend-dot"></span>
+          <span><strong>Accept</strong>: bot will prioritize these zones, rows, or seats.</span>
+        </div>
+        <div class="legend-item legend-item-except">
+          <span class="legend-dot"></span>
+          <span><strong>Except</strong>: bot will always skip these zones, rows, or seats.</span>
+        </div>
+      </div>
       
       <div class="form-group margin-top-xs zone-priority-section">
         <div class="label-row">
-          <label>Zone Priority (Max 4)</label>
+          <label>Zone Priority</label>
           <button id="scanZonesBtn" class="btn-text">Scan Page Zones</button>
         </div>
         <div id="zoneChoices" class="zone-tag-input" aria-label="Zone priority tags">
           <input type="text" id="zonePriorityInput" placeholder="Type zone and press Enter" autocomplete="off">
         </div>
-        <span class="help-text">Enter up to 4 zones. If none are available, auto-selects the nearest available zone.</span>
+        <span class="help-text">Enter as many zones as you want. If none are available, auto-selects the next available zone not in Except.</span>
       </div>
 
       <!-- Scanned Zones status (Hidden by default) -->
@@ -89,8 +99,25 @@
       <div class="form-group">
         <label for="seatSelector">Seat Row Priority List</label>
         <input type="text" id="seatSelector" placeholder="AA, A, B" autocomplete="off">
-        <span class="help-text">Selects the first available seat in priority rows.</span>
+        <span class="help-text">Comma-separated priorities with no limit. Supports exact seats like A12 and rows like AA or B.</span>
       </div>
+
+      <div class="form-group">
+        <label for="excludedZones">Except Zones</label>
+        <input type="text" id="excludedZones" placeholder="A3, B5, VIP" autocomplete="off">
+        <span class="help-text">Zones in this list will never be selected, even as fallback.</span>
+      </div>
+
+      <div class="form-group">
+        <label for="excludedSeats">Except Seats / Rows</label>
+        <input type="text" id="excludedSeats" placeholder="A1, A2, AA, B" autocomplete="off">
+        <span class="help-text">Supports exact seats like A12 and whole rows like AA or B.</span>
+      </div>
+    </div>
+
+    <div class="debug-actions">
+      <button id="downloadLogsBtn" class="btn btn-secondary" type="button">Download Logs</button>
+      <span class="help-text">Exports current zone logs without stopping the bot.</span>
     </div>
 
     <div class="footer">

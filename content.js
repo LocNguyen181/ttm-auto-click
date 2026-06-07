@@ -1,5 +1,6 @@
 (function () {
   const DEFAULT_CLICK_SELECTOR = '.btn-buynow, .btn-item a.btn, a.btn-buynow, a.btn-red[href*="booking"], a[href*="/booking/"]';
+  const SCRIPT_INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
   let settings = {
     isActive: false,
@@ -8,6 +9,8 @@
     targetTime: '',
     zoneSelector: '',  // comma-separated priority list e.g. "A1, V3, B1"
     seatSelector: '',  // comma-separated row priority list e.g. "AA, A, B"
+    excludedZones: '', // comma-separated zones to never select
+    excludedSeats: '', // comma-separated seat names or rows to never select
     autoNavigate: true,
     autoClick: true
   };
@@ -26,20 +29,38 @@
   let lastVerifyClickAt = 0;
   let lastQueueRedirectAt = 0;
   let lastEventNoMatchLogAt = 0;
+  let lastZoneClickAt = 0;
+  let zoneClickLogs = [];
+  let hudRoot = null;
+  let hudStatusEl = null;
+  let hudPageEl = null;
+  let hudLogEl = null;
+  let hudZoneLogs = [];
+  let cachedAvailabilityRows = null;
+  let cachedMapAreas = null;
+  let cachedMapZoneCandidates = null;
   const SKIPPED_ZONES_KEY = 'ttmHelperSkippedZones';
+  const LAST_ATTEMPTED_ZONE_KEY = 'ttmHelperLastAttemptedZone';
+  const PENDING_ZONE_ATTEMPT_KEY = 'ttmHelperPendingZoneAttempt';
+  const ZONE_CLICK_LOGS_KEY = 'ttmHelperZoneClickLogs';
+  const LAST_ZONE_CLICK_AT_KEY = 'ttmHelperLastZoneClickAt';
   const EVENT_ACTION_LOCK_KEY = 'ttmHelperEventActionLock';
   const EVENT_ACTION_LOCK_MS = 12000;
-  const MAX_AVAILABILITY_WAIT_MS = 18000;
+  const MAX_AVAILABILITY_WAIT_MS = 2500;
+  const AVAILABILITY_WAIT_POLL_MS = 100;
+  const ZONE_CLICK_VERIFY_MS = 250;
+  const ZONE_SEAT_MAP_WAIT_MS = 2500;
+  const SEAT_MAP_LOAD_TIMEOUT_MS = 3000;
   const ENABLE_CONSOLE_LOGS = false;
   const STEP_DELAY_MS = {
-    event: 1800,
-    selectPerformance: 1000,
-    verify: 700,
-    round: 1200,
-    availability: 1600,
-    zone: 900,
-    seat: 700,
-    bookNow: 900
+    event: 0,
+    selectPerformance: 0,
+    verify: 0,
+    round: 0,
+    availability: 0,
+    zone: 0,
+    seat: 0,
+    bookNow: 0
   };
 
   function debugLog(message, data) {
@@ -55,6 +76,36 @@
     }
 
     return entry;
+  }
+
+  function appendZoneClickLog(zoneName, status = 'clicked', details = {}) {
+    hydrateZoneLogsFromStorage();
+    const now = Date.now();
+    const deltaMs = lastZoneClickAt > 0 ? now - lastZoneClickAt : null;
+    lastZoneClickAt = now;
+
+    zoneClickLogs.push({
+      at: new Date(now).toISOString(),
+      zone: zoneName || 'unknown',
+      status,
+      sincePrevMs: deltaMs,
+      scriptInstanceId: SCRIPT_INSTANCE_ID,
+      ...getZoneTraceContext(),
+      ...details
+    });
+    if (zoneClickLogs.length > 500) {
+      zoneClickLogs = zoneClickLogs.slice(-500);
+    }
+    persistZoneLogsToStorage();
+    persistZoneLogsToChromeStorage();
+  }
+
+  function getZoneTraceContext() {
+    return {
+      url: window.location.href,
+      pageType: getHudPageLabel(),
+      readyState: document.readyState
+    };
   }
 
   function getElementDebugInfo(el) {
@@ -74,7 +125,7 @@
   chrome.storage.local.get(
     [
       'isActive', 'targetUrl', 'targetDate', 'targetTime',
-      'zoneSelector', 'seatSelector',
+      'zoneSelector', 'seatSelector', 'excludedZones', 'excludedSeats',
       'autoNavigate', 'autoClick'
     ],
     (result) => {
@@ -94,12 +145,21 @@
     }
   });
 
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type !== 'downloadLogs') return;
+    downloadZoneLogsWhenReady().then(sendResponse);
+    return true;
+  });
+
+  hydrateZoneLogsFromStorage();
+
   function updateSettings(newSettings) {
     for (let key in newSettings) {
       if (newSettings[key] === undefined) delete newSettings[key];
     }
     settings = { ...settings, ...newSettings };
     debugLog('Settings updated', getSettingsDebugInfo());
+    updateHud();
 
     if (settings.isActive) {
       if (handleQueuePage()) return;
@@ -116,9 +176,84 @@
       targetTime: settings.targetTime,
       zoneSelector: settings.zoneSelector,
       seatSelector: settings.seatSelector,
+      excludedZones: settings.excludedZones,
+      excludedSeats: settings.excludedSeats,
       autoNavigate: settings.autoNavigate,
       autoClick: settings.autoClick
     };
+  }
+
+  function ensureHud() {
+    if (hudRoot?.isConnected) return hudRoot;
+    if (!document.documentElement) return null;
+
+    hudRoot = document.createElement('div');
+    hudRoot.id = 'ttm-helper-hud';
+    hudRoot.style.cssText = [
+      'position:fixed',
+      'top:12px',
+      'right:12px',
+      'z-index:2147483647',
+      'min-width:220px',
+      'max-width:320px',
+      'padding:10px 12px',
+      'border-radius:12px',
+      'background:rgba(11,12,22,0.92)',
+      'border:1px solid rgba(255,255,255,0.12)',
+      'box-shadow:0 10px 30px rgba(0,0,0,0.28)',
+      'backdrop-filter:blur(12px)',
+      'color:#ffffff',
+      'font:12px/1.4 Outfit, Arial, sans-serif'
+    ].join(';');
+
+    const titleEl = document.createElement('div');
+    titleEl.textContent = 'TTM Helper';
+    titleEl.style.cssText = 'font-weight:700;font-size:12px;letter-spacing:0.2px;margin-bottom:8px;';
+
+    hudStatusEl = document.createElement('div');
+    hudPageEl = document.createElement('div');
+    hudLogEl = document.createElement('div');
+
+    [hudStatusEl, hudPageEl, hudLogEl].forEach(el => {
+      el.style.cssText = 'margin-top:4px;color:#c7c9de;word-break:break-word;';
+    });
+    hudStatusEl.style.marginTop = '0';
+
+    hudRoot.appendChild(titleEl);
+    hudRoot.appendChild(hudStatusEl);
+    hudRoot.appendChild(hudPageEl);
+    hudRoot.appendChild(hudLogEl);
+
+    (document.body || document.documentElement).appendChild(hudRoot);
+    return hudRoot;
+  }
+
+  function updateHud() {
+    const hud = ensureHud();
+    if (!hud || !hudStatusEl || !hudPageEl || !hudLogEl) return;
+
+    hud.style.display = 'block';
+    hudStatusEl.innerHTML = `Status: <strong style="color:${settings.isActive ? '#10b981' : '#ef4444'}">${settings.isActive ? 'Active' : 'Inactive'}</strong>`;
+    hudPageEl.textContent = `Page: ${getHudPageLabel()}`;
+    hudLogEl.innerHTML = hudZoneLogs.length > 0
+      ? `Zone log:<br>${hudZoneLogs.map(item => `- ${item}`).join('<br>')}`
+      : 'Zone log: None';
+  }
+
+  function getHudPageLabel() {
+    if (isSeatPage()) return 'Seat Selection';
+    if (isZoneSelectionPage()) return 'Zone Selection';
+    if (isVerifyConditionPage()) return 'Verification';
+    if (isQueueUrl(window.location.href)) return 'Queue';
+    return 'Event / Other';
+  }
+
+  function setHudZoneLog(zoneName, status = 'clicked') {
+    if (zoneName) {
+      hudZoneLogs.unshift(`${zoneName} (${status})`);
+      hudZoneLogs = hudZoneLogs.slice(0, 5);
+    }
+    updateHud();
   }
 
   // ==================== NAVIGATION ====================
@@ -213,9 +348,11 @@
   // ==================== AUTOMATION CYCLE ====================
   function runAutomationCycle() {
     if (!settings.isActive) return;
+    updateHud();
 
     const url = window.location.href;
     if (handleQueuePage()) return;
+    if (handlePendingZoneAttemptTimeout()) return;
 
     if (url.includes('booking.thaiticketmajor.com')) {
       // On booking subdomain
@@ -228,7 +365,7 @@
         handleBookingRoundAndZone();
       }
     } else {
-      clearSkippedZones();
+      if (!hasActiveBookingAttempt()) clearSkippedZones();
       // On main event details page
       if (settings.autoClick) {
         if (isTooFrequentVerificationPage()) {
@@ -641,7 +778,7 @@
     const zoneMap = new Map();
 
     const addZone = (zoneName) => {
-      const zone = (zoneName || '').replace(/^#/, '').trim();
+      const zone = getCanonicalZoneName(zoneName);
       if (!isLikelyZoneName(zone)) return;
 
       const key = zone.toLowerCase();
@@ -654,14 +791,14 @@
       addZone(matches[matches.length - 1].replace(/^#/, ''));
     };
 
-    document.querySelectorAll('.map-zone area[href], .select-zone area[href], map area[href]').forEach(el => {
+    getCachedMapAreas().forEach(el => {
       addZoneFromHref(el.getAttribute('href'));
       addZone(el.getAttribute('data-zone'));
       addZone(el.getAttribute('data-zone-id'));
       addZone(el.getAttribute('data-zone-label'));
     });
 
-    document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr').forEach(row => {
+    getCachedAvailabilityRows().forEach(row => {
       const cells = row.querySelectorAll('td');
       if (cells.length < 2) return;
 
@@ -676,9 +813,29 @@
     return [...zoneMap.values()].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }
 
+  function getCanonicalZoneName(zoneName) {
+    const rawZone = String(zoneName || '').replace(/^#/, '').trim();
+    if (!rawZone) return '';
+
+    const normalizedRaw = rawZone.toUpperCase();
+    const ignoredTokens = new Set(['ZONE', 'SEAT', 'ROW', 'AREA', 'PRICE', 'TOTAL']);
+    if (normalizedRaw === 'VIP') return 'VIP';
+    if (/^[A-Z]{1,4}\d{1,3}$/.test(normalizedRaw)) return normalizedRaw;
+    if (/^[A-Z]{1,2}$/.test(normalizedRaw)) return normalizedRaw;
+
+    const tokens = normalizedRaw.match(/[A-Z]{1,4}\d{0,3}/g) || [];
+    const preferredToken = tokens.find(token => token === 'VIP' || /\d/.test(token));
+    if (preferredToken && !ignoredTokens.has(preferredToken)) return preferredToken;
+
+    const fallbackToken = tokens.find(token => /^[A-Z]{1,2}$/.test(token) && !ignoredTokens.has(token));
+    if (fallbackToken) return fallbackToken;
+
+    return '';
+  }
+
   function isLikelyZoneName(zoneName) {
-    const zone = (zoneName || '').trim().toUpperCase();
-    return zone === 'VIP' || /^[A-Z]{1,4}\d{0,3}$/.test(zone);
+    const zone = getCanonicalZoneName(zoneName);
+    return zone === 'VIP' || /^[A-Z]{1,4}\d{1,3}$/.test(zone) || /^[A-Z]{1,2}$/.test(zone);
   }
 
   function handleBookingRoundAndZone() {
@@ -697,7 +854,7 @@
     openAndReloadAvailability();
 
     const refreshStartedAt = Date.now();
-    setTimeout(() => selectZoneAfterAvailabilityRefresh(refreshStartedAt), STEP_DELAY_MS.availability);
+    setTimeout(() => selectZoneAfterAvailabilityRefresh(refreshStartedAt), 0);
   }
 
   function selectZoneAfterAvailabilityRefresh(refreshStartedAt) {
@@ -719,7 +876,7 @@
         elapsedMs,
         maxWaitMs: MAX_AVAILABILITY_WAIT_MS
       });
-      setTimeout(() => selectZoneAfterAvailabilityRefresh(refreshStartedAt), 1000);
+      setTimeout(() => selectZoneAfterAvailabilityRefresh(refreshStartedAt), AVAILABILITY_WAIT_POLL_MS);
       return;
     }
 
@@ -729,6 +886,7 @@
   }
 
   function openAndReloadAvailability() {
+    invalidateZoneDomCache();
     const popupButton = document.getElementById('popup-avail');
     if (popupButton && isVisible(popupButton)) {
       dispatchClickSequence(popupButton);
@@ -785,15 +943,14 @@
 
     if (!hasAvailabilityTable() && !allowMapFallback) {
       debugLog('Seats Available table not ready yet. Waiting before zone selection');
-      if (currentObserver) currentObserver.disconnect();
-      currentObserver = new MutationObserver(() => {
+      observeZoneArea(() => {
+        invalidateZoneDomCache();
         if (!hasAvailabilityTable() || zoneClickPending) return;
         currentObserver.disconnect();
         currentObserver = null;
         logZoneAvailabilitySnapshot();
         autoClickZoneWithFallback();
-      });
-      currentObserver.observe(document.documentElement, { childList: true, subtree: true });
+      }, { allowMapFallback });
       return;
     }
 
@@ -804,17 +961,38 @@
     const zonePriorities = settings.zoneSelector
       .split(',')
       .map(z => z.trim())
-      .filter(Boolean)
-      .slice(0, 4);
+      .filter(Boolean);
+    const excludedZones = getExcludedZoneSet();
 
-    debugLog('Zone priority list', zonePriorities);
+    debugLog('Zone priority list', {
+      zonePriorities,
+      excludedZones: [...excludedZones]
+    });
     logZoneAvailabilitySnapshot();
 
     const tryZones = () => {
       const skippedZones = getSkippedZones();
+      appendZoneClickLog('scan-state', 'zone-scan-state', {
+        nextAction: 'try-zone-priorities',
+        zonePriorities,
+        skippedZones,
+        excludedZones: [...excludedZones],
+        pendingAttempt: getPendingZoneAttempt(),
+        lastAttemptedZone: getLastAttemptedZone(),
+        allowMapFallback,
+        hasAvailabilityTable: hasAvailabilityTable(),
+        zoneClickPending,
+        availabilityRefreshPending
+      });
 
       for (const zoneName of zonePriorities) {
-        if (skippedZones.includes(normalizeZoneName(zoneName))) {
+        const normalizedZone = normalizeZoneName(zoneName);
+        if (excludedZones.has(normalizedZone)) {
+          debugLog('Zone is excluded by user. Skipping', zoneName);
+          continue;
+        }
+
+        if (skippedZones.includes(normalizedZone)) {
           debugLog('Zone was already tried without seats. Skipping', zoneName);
           continue;
         }
@@ -827,6 +1005,7 @@
             return true;
           }
 
+          appendZoneClickLog(zoneName, 'priority-not-available', { nextAction: 'try-next-priority' });
           debugLog('Priority zone is not available after refresh. Trying next', zoneName);
           continue;
         }
@@ -842,11 +1021,19 @@
             zoneName,
             clickResult
           });
+          appendZoneClickLog(zoneName, 'priority-map-fallback-miss', {
+            nextAction: 'try-next-priority',
+            clickResult
+          });
         }
       }
 
-      const fallbackZone = findFirstAvailableZone([...zonePriorities, ...skippedZones], allowMapFallback);
+      const fallbackZone = findFirstAvailableZone(
+        [...zonePriorities, ...skippedZones, ...excludedZones],
+        allowMapFallback
+      );
       if (fallbackZone) {
+        appendZoneClickLog(fallbackZone.name, 'fallback-zone-selected', { nextAction: 'click-fallback-zone' });
         clickZoneElement(fallbackZone.el, fallbackZone.name);
         debugLog('Priority zones unavailable. Fallback zone selected', fallbackZone.name);
         return true;
@@ -861,20 +1048,20 @@
     }
 
     if (!tryZones()) {
-      currentObserver = new MutationObserver(() => {
+      observeZoneArea(() => {
+        invalidateZoneDomCache();
         if (tryZones()) {
           currentObserver.disconnect();
           currentObserver = null;
         }
-      });
-      currentObserver.observe(document.documentElement, { childList: true, subtree: true });
+      }, { allowMapFallback: true });
     }
   }
 
   function getAvailableZoneFromAvailabilityTable(zoneName) {
     const normalizedTarget = normalizeZoneName(zoneName);
     if (!normalizedTarget) return null;
-    return getAvailableZonesFromAvailabilityTable(getSkippedZones())
+    return getAvailableZonesFromAvailabilityTable([...getSkippedZones(), ...getExcludedZoneSet()])
       .find(item => normalizeZoneName(item.name) === normalizedTarget) || null;
   }
 
@@ -886,12 +1073,12 @@
     const zoneClean = normalizeZoneName(zoneName);
 
     // 1. Prefer the Seats Available table when it exists because it carries availability state.
-    const availabilityRows = document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr');
+    const availabilityRows = getCachedAvailabilityRows();
     for (let el of availabilityRows) {
       const candidateName = getZoneNameFromElement(el);
       if (normalizeZoneName(candidateName) === zoneClean) {
         if (isZoneSoldOut(el, zoneName)) return 'sold-out';
-        if (clickedElements.has(el)) return 'clicked';
+        if (zoneClickPending) return 'available-not-clicked';
 
         clickZoneElement(el, zoneName);
         return 'clicked';
@@ -899,13 +1086,13 @@
     }
 
     // 2. Search <area> elements (image map zones)
-    const areas = document.querySelectorAll('area');
+    const areas = getCachedMapAreas();
     for (let el of areas) {
       const candidateName = getZoneNameFromElement(el);
       if (normalizeZoneName(candidateName) === zoneClean) {
         // Check if the area (or its parent) indicates sold-out
         if (isZoneSoldOut(el, zoneName)) return 'sold-out';
-        if (clickedElements.has(el)) return 'clicked';
+        if (zoneClickPending) return 'available-not-clicked';
 
         clickZoneElement(el, zoneName);
         return 'clicked';
@@ -913,13 +1100,13 @@
     }
 
     // 3. Search zone buttons/links with data-zone or text matching
-    const candidates = document.querySelectorAll('a, button, div, rect, path, [data-zone]');
+    const candidates = getCachedMapZoneCandidates();
     for (let el of candidates) {
       const candidateName = getZoneNameFromElement(el);
       if (normalizeZoneName(candidateName) === zoneClean) {
         if (isZoneSoldOut(el, zoneName)) return 'sold-out';
         if (!isVisible(el)) return 'available-not-clicked';
-        if (clickedElements.has(el)) return 'clicked';
+        if (zoneClickPending) return 'available-not-clicked';
 
         clickZoneElement(el, zoneName);
         return 'clicked';
@@ -936,8 +1123,8 @@
     if (hasAvailabilityTable() || !allowMapFallback) return null;
 
     const candidates = [
-      ...document.querySelectorAll('area'),
-      ...document.querySelectorAll('a[href*="#"], a[onclick*="selectzone"], button[data-zone], .zone-item, [data-zone]')
+      ...getCachedMapAreas(),
+      ...getCachedMapZoneCandidates()
     ];
     const seen = new Set();
 
@@ -963,7 +1150,7 @@
     const availableZones = [];
     const seen = new Set();
 
-    for (const el of document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr')) {
+    for (const el of getCachedAvailabilityRows()) {
       const zoneName = getZoneNameFromElement(el);
       const normalized = normalizeZoneName(zoneName);
       if (!normalized || !isLikelyZoneName(zoneName) || excluded.includes(normalized) || seen.has(normalized)) continue;
@@ -980,7 +1167,7 @@
   }
 
   function hasAvailabilityTable() {
-    return Boolean(document.querySelector('#avail_data table tbody tr, #popup-event-zone table tbody tr'));
+    return getCachedAvailabilityRows().length > 0;
   }
 
   function getZoneAvailableSeatCount(el) {
@@ -1000,7 +1187,7 @@
     }
 
     const skippedZones = getSkippedZones();
-    const rows = [...document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr')]
+    const rows = getCachedAvailabilityRows()
       .map(row => ({
         zone: getZoneNameFromElement(row),
         seatsAvailable: getZoneAvailableSeatCount(row)
@@ -1021,13 +1208,283 @@
   function clickZoneElement(el, zoneName) {
     if (zoneClickPending) return;
     zoneClickPending = true;
-    clickedElements.add(el);
+    persistLastAttemptedZone(zoneName);
+    persistPendingZoneAttempt(zoneName);
+    markZoneSkipped(zoneName);
+    invalidateZoneDomCache();
+    appendZoneClickLog(zoneName, 'clicked', { nextAction: 'verify-zone-click-result' });
+    appendZoneClickLog(zoneName, 'marked-skipped-on-attempt', { nextAction: 'prevent-zone-retry-loop' });
+    setHudZoneLog(zoneName, 'clicked');
     debugLog('Scheduling zone click', { zoneName, delayMs: STEP_DELAY_MS.zone });
     scheduleDelayedClick(`zone-${normalizeZoneName(zoneName)}`, STEP_DELAY_MS.zone, () => {
       debugLog('Clicking zone', zoneName);
       el.click();
       el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      appendZoneClickLog(zoneName, 'post-click-dispatched');
+      setTimeout(() => verifyZoneClickResult(zoneName), ZONE_CLICK_VERIFY_MS);
     });
+  }
+
+  function verifyZoneClickResult(zoneName, verifyStartedAt = Date.now()) {
+    if (!settings.isActive) {
+      zoneClickPending = false;
+      appendZoneClickLog(zoneName, 'post-click-inactive');
+      return;
+    }
+
+    if (hasSeatPageEvidence()) {
+      zoneClickPending = false;
+      clearPendingZoneAttempt();
+      appendZoneClickLog(zoneName, 'post-click-seat-page');
+      return;
+    }
+
+    const isSeatTransitionUrl = window.location.href.includes('seat') || window.location.href.includes('fixed.php');
+    const elapsedMs = Date.now() - verifyStartedAt;
+    if (isSeatTransitionUrl && elapsedMs < ZONE_SEAT_MAP_WAIT_MS) {
+      appendZoneClickLog(zoneName, 'post-click-wait-seat-map', {
+        nextAction: 'wait-seat-map',
+        elapsedMs
+      });
+      setTimeout(() => verifyZoneClickResult(zoneName, verifyStartedAt), AVAILABILITY_WAIT_POLL_MS);
+      return;
+    }
+
+    if (!isZoneSelectionPage()) {
+      zoneClickPending = false;
+      appendZoneClickLog(zoneName, 'post-click-other-page');
+      return;
+    }
+
+    zoneClickPending = false;
+    markZoneSkipped(zoneName);
+    clearPendingZoneAttempt();
+    appendZoneClickLog(zoneName, 'post-click-still-zone-page', {
+      nextAction: 'skip-and-try-next'
+    });
+    appendZoneClickLog(zoneName, 'retry-next');
+    setHudZoneLog(zoneName, 'retry-next');
+    debugLog('Zone click did not leave zone page. Skipping zone and trying next', zoneName);
+    autoClickZoneWithFallback({ allowMapFallback: true });
+  }
+
+  function downloadZoneLogsFile() {
+    try {
+      hydrateZoneLogsFromStorage();
+      const lines = [
+        'TTM Helper Zone Log',
+        `generated_at=${new Date().toISOString()}`,
+        `page=${window.location.href}`,
+        `entries=${zoneClickLogs.length}`,
+        ''
+      ];
+
+      if (zoneClickLogs.length === 0) {
+        return { ok: false, error: 'empty-log', logCount: 0 };
+      }
+
+      zoneClickLogs.forEach((entry, index) => {
+        lines.push(
+          `${index + 1}. at=${entry.at} | zone=${entry.zone} | status=${entry.status} | since_prev_ms=${entry.sincePrevMs === null ? 'first-click' : entry.sincePrevMs} | script_instance=${entry.scriptInstanceId || ''} | page_type=${entry.pageType || ''} | ready_state=${entry.readyState || ''} | next_action=${entry.nextAction || ''} | click_result=${entry.clickResult || ''} | url=${entry.url || ''} | details=${formatZoneLogDetails(entry)}`
+        );
+      });
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = objectUrl;
+      link.download = `ttm-helper-zone-log-${timestamp}.log`;
+      link.style.display = 'none';
+      (document.body || document.documentElement).appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+
+      return { ok: true, entries: lines.length, logCount: zoneClickLogs.length };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message ? err.message : err) };
+    }
+  }
+
+  async function downloadZoneLogsWhenReady() {
+    const delayMs = getZoneLogExportDelayMs();
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      handlePendingZoneAttemptTimeout();
+    }
+
+    return downloadZoneLogsFile();
+  }
+
+  function getZoneLogExportDelayMs() {
+    const pendingAttempt = getPendingZoneAttempt();
+    if (!pendingAttempt || !isSeatTransitionPage() || hasSeatPageEvidence()) return 0;
+
+    const elapsedMs = Date.now() - pendingAttempt.startedAt;
+    const targetMs = SEAT_MAP_LOAD_TIMEOUT_MS + AVAILABILITY_WAIT_POLL_MS;
+    return Math.max(targetMs - elapsedMs, 0);
+  }
+
+  function formatZoneLogDetails(entry) {
+    const hiddenKeys = new Set([
+      'at',
+      'zone',
+      'status',
+      'sincePrevMs',
+      'scriptInstanceId',
+      'url',
+      'pageType',
+      'readyState',
+      'nextAction',
+      'clickResult'
+    ]);
+    const details = {};
+    Object.keys(entry || {}).forEach(key => {
+      if (!hiddenKeys.has(key)) details[key] = entry[key];
+    });
+    return Object.keys(details).length > 0 ? JSON.stringify(details) : '';
+  }
+
+  function hydrateZoneLogsFromStorage() {
+    try {
+      const rawLogs = sessionStorage.getItem(ZONE_CLICK_LOGS_KEY) || localStorage.getItem(ZONE_CLICK_LOGS_KEY) || '[]';
+      const parsedLogs = JSON.parse(rawLogs);
+      zoneClickLogs = Array.isArray(parsedLogs) ? parsedLogs : [];
+
+      const rawLastAt = sessionStorage.getItem(LAST_ZONE_CLICK_AT_KEY) || localStorage.getItem(LAST_ZONE_CLICK_AT_KEY) || '0';
+      lastZoneClickAt = Number(rawLastAt) || 0;
+    } catch (err) {
+      zoneClickLogs = [];
+      lastZoneClickAt = 0;
+    }
+  }
+
+  function persistZoneLogsToStorage() {
+    try {
+      const logsJson = JSON.stringify(zoneClickLogs.slice(-500));
+      sessionStorage.setItem(ZONE_CLICK_LOGS_KEY, logsJson);
+      localStorage.setItem(ZONE_CLICK_LOGS_KEY, logsJson);
+
+      const lastAtValue = String(lastZoneClickAt || 0);
+      sessionStorage.setItem(LAST_ZONE_CLICK_AT_KEY, lastAtValue);
+      localStorage.setItem(LAST_ZONE_CLICK_AT_KEY, lastAtValue);
+    } catch (err) {
+      // Ignore storage write failures.
+    }
+  }
+
+  function clearZoneLogsStorage() {
+    try {
+      sessionStorage.removeItem(ZONE_CLICK_LOGS_KEY);
+      localStorage.removeItem(ZONE_CLICK_LOGS_KEY);
+      sessionStorage.removeItem(LAST_ZONE_CLICK_AT_KEY);
+      localStorage.removeItem(LAST_ZONE_CLICK_AT_KEY);
+    } catch (err) {
+      // Ignore storage cleanup failures.
+    }
+    chrome.storage.local.remove([ZONE_CLICK_LOGS_KEY, LAST_ZONE_CLICK_AT_KEY]);
+  }
+
+  function persistZoneLogsToChromeStorage() {
+    chrome.storage.local.set({
+      [ZONE_CLICK_LOGS_KEY]: zoneClickLogs.slice(-500),
+      [LAST_ZONE_CLICK_AT_KEY]: lastZoneClickAt || 0
+    });
+  }
+
+  function isZoneSelectionPage() {
+    const url = window.location.href;
+    return url.includes('zones.php') ||
+      Boolean(document.querySelector('.map-zone, .select-zone, map area')) ||
+      Boolean(document.getElementById('rdId')) ||
+      hasAvailabilityTable();
+  }
+
+  function invalidateZoneDomCache() {
+    cachedAvailabilityRows = null;
+    cachedMapAreas = null;
+    cachedMapZoneCandidates = null;
+  }
+
+  function getCachedAvailabilityRows() {
+    if (cachedAvailabilityRows) return cachedAvailabilityRows;
+    cachedAvailabilityRows = [
+      ...document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr')
+    ];
+    return cachedAvailabilityRows;
+  }
+
+  function getCachedMapAreas() {
+    if (cachedMapAreas) return cachedMapAreas;
+    cachedMapAreas = [
+      ...document.querySelectorAll('.map-zone area[href], .select-zone area[href], map area[href], area')
+    ];
+    return cachedMapAreas;
+  }
+
+  function getCachedMapZoneCandidates() {
+    if (cachedMapZoneCandidates) return cachedMapZoneCandidates;
+    const candidateSelector = [
+      'a[href*="#"]',
+      'a[onclick*="selectzone"]',
+      'button[data-zone]',
+      '.zone-item',
+      '[data-zone]',
+      '[data-zone-id]',
+      '[data-zone-label]',
+      '[alt]',
+      '[title]'
+    ].join(', ');
+    const roots = [
+      ...document.querySelectorAll('.map-zone, .select-zone, map, .zone-wrapper, .zone-container')
+    ];
+
+    const candidates = [];
+    const seen = new WeakSet();
+    const addCandidatesFromRoot = (root) => {
+      if (!root || typeof root.querySelectorAll !== 'function') return;
+      if (root.matches?.(candidateSelector) && !seen.has(root)) {
+        seen.add(root);
+        candidates.push(root);
+      }
+      root.querySelectorAll(candidateSelector).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        candidates.push(el);
+      });
+    };
+
+    roots.forEach(addCandidatesFromRoot);
+
+    // If TTM renders without a known wrapper, keep a narrow document-level fallback.
+    if (candidates.length === 0) {
+      document.querySelectorAll('a[href*="#"], a[onclick*="selectzone"], button[data-zone], [data-zone], [data-zone-id], [data-zone-label]')
+        .forEach(el => {
+          if (seen.has(el)) return;
+          seen.add(el);
+          candidates.push(el);
+        });
+    }
+
+    cachedMapZoneCandidates = candidates;
+    return cachedMapZoneCandidates;
+  }
+
+  function getZoneObservationRoot(allowMapFallback = false) {
+    const availabilityRoot = document.querySelector('#avail_data, #popup-event-zone');
+    if (availabilityRoot) return availabilityRoot;
+    if (allowMapFallback) {
+      return document.querySelector('.map-zone, .select-zone, map') || document.body || document.documentElement;
+    }
+    return document.querySelector('.booking-content, .zone-wrapper, .zone-container') || document.body || document.documentElement;
+  }
+
+  function observeZoneArea(callback, options = {}) {
+    const allowMapFallback = Boolean(options.allowMapFallback);
+    if (currentObserver) currentObserver.disconnect();
+    currentObserver = new MutationObserver(callback);
+    currentObserver.observe(getZoneObservationRoot(allowMapFallback), { childList: true, subtree: true });
   }
 
   function getZoneNameFromElement(el) {
@@ -1057,7 +1514,7 @@
   }
 
   function normalizeZoneName(zoneName) {
-    return (zoneName || '').trim().toLowerCase();
+    return getCanonicalZoneName(zoneName).toLowerCase();
   }
 
   /**
@@ -1094,15 +1551,33 @@
       return;
     }
 
+    const currentZone = getCurrentZoneName();
+    if (isZoneExcluded(currentZone)) {
+      markZoneSkipped(currentZone);
+      debugLog('Current zone is excluded by user. Returning to zone selection', currentZone);
+      navigateBackToZoneSelection();
+      return;
+    }
+
     const seatPriorities = settings.seatSelector
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
+    const excludedSeatRules = getExcludedSeatRules();
 
-    debugLog('Seat row priority list', seatPriorities);
+    debugLog('Seat row priority list', {
+      seatPriorities,
+      excludedExactSeats: [...excludedSeatRules.exactSeats],
+      excludedRows: [...excludedSeatRules.rows]
+    });
 
     const trySeats = () => {
       for (const seatPriority of seatPriorities) {
+        if (isSeatRuleExcluded(seatPriority, excludedSeatRules)) {
+          debugLog('Seat priority excluded by user. Skipping', seatPriority);
+          continue;
+        }
+
         const result = tryClickSeatPriority(seatPriority);
         if (result === 'clicked') {
           debugLog('Seat priority candidate selected', seatPriority);
@@ -1112,7 +1587,7 @@
         }
       }
 
-      const fallbackSeat = findFirstAvailableSeat([]);
+      const fallbackSeat = findFirstAvailableSeat([], excludedSeatRules);
       if (fallbackSeat) {
         clickSeatElement(fallbackSeat.el, fallbackSeat.name);
         debugLog('Fallback seat click candidate selected', fallbackSeat.name);
@@ -1144,7 +1619,29 @@
       seatUnavailableTimer = null;
       if (!settings.isActive || !isSeatPage()) return;
       if (seatClickPending || hasSelectedSeat()) return;
-      if (!isSeatMapLoaded()) return;
+      if (!isSeatMapLoaded()) {
+        if (isSeatTransitionPage()) {
+          const currentZone = getCurrentZoneName();
+          if (currentZone) {
+            markZoneSkipped(currentZone);
+            clearPendingZoneAttempt();
+            appendZoneClickLog(currentZone, 'seat-map-timeout-skip-zone', {
+              nextAction: 'return-to-zone-selection'
+            });
+            setHudZoneLog(currentZone, 'seat-map-timeout');
+            debugLog('Seat map did not render after zone click. Returning to zone selection', currentZone);
+          } else {
+            clearPendingZoneAttempt();
+            appendZoneClickLog('unknown', 'seat-map-timeout-skip-zone', {
+              nextAction: 'return-to-zone-selection'
+            });
+            debugLog('Seat map did not render after zone click. Returning to zone selection');
+          }
+
+          navigateBackToZoneSelection();
+        }
+        return;
+      }
       if (hasUntriedAvailableSeat()) return;
 
       const currentZone = getCurrentZoneName();
@@ -1156,12 +1653,21 @@
       }
 
       navigateBackToZoneSelection();
-    }, 3500);
+    }, SEAT_MAP_LOAD_TIMEOUT_MS);
   }
 
   function isSeatPage() {
     const url = window.location.href;
     return url.includes('seat') || url.includes('fixed.php') || Boolean(document.getElementById('tableseats'));
+  }
+
+  function isSeatTransitionPage() {
+    const url = window.location.href;
+    return url.includes('seat') || url.includes('fixed.php');
+  }
+
+  function hasSeatPageEvidence() {
+    return isSeatMapLoaded();
   }
 
   function isSeatMapLoaded() {
@@ -1176,7 +1682,7 @@
   }
 
   function hasUntriedAvailableSeat() {
-    return Boolean(findFirstAvailableSeat([]));
+    return Boolean(findFirstAvailableSeat([], getExcludedSeatRules()));
   }
 
   function hasSelectedSeat() {
@@ -1189,21 +1695,33 @@
   }
 
   function getCurrentZoneName() {
-    const zoneInput = document.querySelector('input[name="zone"], input[name="zoneDesc"]');
-    if (zoneInput && zoneInput.value) return zoneInput.value.trim();
+    const candidates = [
+      document.querySelector('input[name="zoneDesc"]')?.value,
+      document.querySelector('input[name="zone"]')?.value
+    ];
 
     const zoneRow = [...document.querySelectorAll('.booking-summary .row')].find(row => (
       row.textContent.toLowerCase().includes('zone')
     ));
     const zoneResult = zoneRow ? zoneRow.querySelector('.result') : null;
-    if (zoneResult && zoneResult.textContent.trim()) return zoneResult.textContent.trim();
+    if (zoneResult?.textContent?.trim()) {
+      candidates.push(zoneResult.textContent.trim());
+    }
+
+    for (const candidate of candidates) {
+      const canonicalZone = getCanonicalZoneName(candidate);
+      if (canonicalZone) return canonicalZone;
+    }
 
     try {
       const url = new URL(window.location.href);
-      return (url.searchParams.get('zone') || '').trim();
+      const zoneFromUrl = getCanonicalZoneName(url.searchParams.get('zone'));
+      if (zoneFromUrl) return zoneFromUrl;
     } catch (err) {
-      return '';
+      // Fall back to stored zone below.
     }
+
+    return getLastAttemptedZone();
   }
 
   function navigateBackToZoneSelection() {
@@ -1213,20 +1731,38 @@
       return;
     }
 
+    const zoneSelectionUrl = buildZoneSelectionUrl();
+    if (zoneSelectionUrl) {
+      window.location.href = zoneSelectionUrl;
+      return;
+    }
+
+    window.history.back();
+  }
+
+  function buildZoneSelectionUrl() {
     try {
+      const currentUrl = new URL(window.location.href);
+      const currentQuery = currentUrl.searchParams.get('query');
+      const currentRdId = currentUrl.searchParams.get('rdId');
+      if (currentQuery) {
+        const rdIdSuffix = currentRdId ? `&rdId=${encodeURIComponent(currentRdId)}` : '';
+        return `/booking/3m/zones.php?query=${encodeURIComponent(currentQuery)}${rdIdSuffix}`;
+      }
+
       const paymentForm = document.getElementById('frmPayment');
       const actionUrl = paymentForm ? new URL(paymentForm.getAttribute('action'), window.location.href) : null;
       const query = actionUrl ? actionUrl.searchParams.get('query') : '';
-      const rdId = document.querySelector('input[name="rdId"]')?.value || '';
-      if (query && rdId) {
-        window.location.href = `/booking/3m/zones.php?query=${encodeURIComponent(query)}&rdId=${encodeURIComponent(rdId)}`;
-        return;
+      const rdId = document.querySelector('input[name="rdId"]')?.value || actionUrl?.searchParams.get('rdId') || '';
+      if (query) {
+        const rdIdSuffix = rdId ? `&rdId=${encodeURIComponent(rdId)}` : '';
+        return `/booking/3m/zones.php?query=${encodeURIComponent(query)}${rdIdSuffix}`;
       }
     } catch (err) {
       // Fall through to browser history when page metadata is not available.
     }
 
-    window.history.back();
+    return '';
   }
 
   function getSkippedZones() {
@@ -1253,6 +1789,167 @@
   function clearSkippedZones() {
     localStorage.removeItem(SKIPPED_ZONES_KEY);
     sessionStorage.removeItem(SKIPPED_ZONES_KEY);
+    clearLastAttemptedZone();
+  }
+
+  function hasActiveBookingAttempt() {
+    return Boolean(getSkippedZones().length > 0 || getLastAttemptedZone() || getPendingZoneAttempt());
+  }
+
+  function persistLastAttemptedZone(zoneName) {
+    const normalizedZone = normalizeZoneName(zoneName);
+    if (!normalizedZone) return;
+
+    try {
+      localStorage.setItem(LAST_ATTEMPTED_ZONE_KEY, normalizedZone);
+      sessionStorage.setItem(LAST_ATTEMPTED_ZONE_KEY, normalizedZone);
+    } catch (err) {
+      // Ignore storage write failures.
+    }
+  }
+
+  function getLastAttemptedZone() {
+    try {
+      return normalizeZoneName(
+        localStorage.getItem(LAST_ATTEMPTED_ZONE_KEY) ||
+        sessionStorage.getItem(LAST_ATTEMPTED_ZONE_KEY) ||
+        ''
+      ).toUpperCase();
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function clearLastAttemptedZone() {
+    try {
+      localStorage.removeItem(LAST_ATTEMPTED_ZONE_KEY);
+      sessionStorage.removeItem(LAST_ATTEMPTED_ZONE_KEY);
+    } catch (err) {
+      // Ignore storage cleanup failures.
+    }
+  }
+
+  function persistPendingZoneAttempt(zoneName) {
+    const normalizedZone = normalizeZoneName(zoneName);
+    if (!normalizedZone) return;
+
+    const payload = JSON.stringify({
+      zone: normalizedZone,
+      startedAt: Date.now()
+    });
+    try {
+      localStorage.setItem(PENDING_ZONE_ATTEMPT_KEY, payload);
+      sessionStorage.setItem(PENDING_ZONE_ATTEMPT_KEY, payload);
+    } catch (err) {
+      // Ignore storage write failures.
+    }
+
+    setTimeout(() => handlePendingZoneAttemptTimeout(), SEAT_MAP_LOAD_TIMEOUT_MS + AVAILABILITY_WAIT_POLL_MS);
+  }
+
+  function getPendingZoneAttempt() {
+    try {
+      const raw = sessionStorage.getItem(PENDING_ZONE_ATTEMPT_KEY) || localStorage.getItem(PENDING_ZONE_ATTEMPT_KEY) || '';
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const zone = normalizeZoneName(parsed.zone || '');
+      const startedAt = Number(parsed.startedAt) || 0;
+      if (!zone || !startedAt) return null;
+      return { zone, startedAt };
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function clearPendingZoneAttempt() {
+    try {
+      localStorage.removeItem(PENDING_ZONE_ATTEMPT_KEY);
+      sessionStorage.removeItem(PENDING_ZONE_ATTEMPT_KEY);
+    } catch (err) {
+      // Ignore storage cleanup failures.
+    }
+  }
+
+  function handlePendingZoneAttemptTimeout() {
+    const pendingAttempt = getPendingZoneAttempt();
+    if (!pendingAttempt) return false;
+
+    if (hasSeatPageEvidence()) {
+      clearPendingZoneAttempt();
+      return false;
+    }
+
+    if (!isSeatTransitionPage()) return false;
+
+    const elapsedMs = Date.now() - pendingAttempt.startedAt;
+    if (elapsedMs < SEAT_MAP_LOAD_TIMEOUT_MS) return false;
+
+    const zoneName = getCurrentZoneName() || pendingAttempt.zone.toUpperCase();
+    zoneClickPending = false;
+    if (zoneName) {
+      markZoneSkipped(zoneName);
+      appendZoneClickLog(zoneName, 'pending-zone-timeout-skip-zone', {
+        nextAction: 'return-to-zone-selection',
+        elapsedMs
+      });
+      setHudZoneLog(zoneName, 'pending-zone-timeout');
+      debugLog('Pending zone attempt timed out without seat map. Returning to zone selection', zoneName);
+    }
+    clearPendingZoneAttempt();
+    navigateBackToZoneSelection();
+    return true;
+  }
+
+  function getExcludedZoneSet() {
+    return new Set(
+      String(settings.excludedZones || '')
+        .split(',')
+        .map(normalizeZoneName)
+        .filter(Boolean)
+    );
+  }
+
+  function isZoneExcluded(zoneName) {
+    const normalizedZone = normalizeZoneName(zoneName);
+    return Boolean(normalizedZone) && getExcludedZoneSet().has(normalizedZone);
+  }
+
+  function getExcludedSeatRules() {
+    const exactSeats = new Set();
+    const rows = new Set();
+
+    String(settings.excludedSeats || '')
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean)
+      .forEach(value => {
+        if (isLikelySeatRowName(value) && !isLikelySeatName(value)) {
+          rows.add(normalizeSeatRowName(value));
+          return;
+        }
+
+        const seatName = normalizeSeatName(value);
+        if (seatName) exactSeats.add(seatName);
+      });
+
+    return { exactSeats, rows };
+  }
+
+  function isSeatExcluded(seatName, excludedSeatRules = getExcludedSeatRules()) {
+    const normalizedSeat = normalizeSeatName(seatName);
+    if (!normalizedSeat) return false;
+    if (excludedSeatRules.exactSeats.has(normalizedSeat)) return true;
+
+    const seatRow = normalizeSeatRowName(getSeatRowName(seatName));
+    return Boolean(seatRow) && excludedSeatRules.rows.has(seatRow);
+  }
+
+  function isSeatRuleExcluded(seatRule, excludedSeatRules = getExcludedSeatRules()) {
+    if (isLikelySeatRowName(seatRule) && !isLikelySeatName(seatRule)) {
+      return excludedSeatRules.rows.has(normalizeSeatRowName(seatRule));
+    }
+
+    return isSeatExcluded(seatRule, excludedSeatRules);
   }
 
   /**
@@ -1272,12 +1969,14 @@
     let rowFound = false;
 
     const candidates = getSeatCandidates();
+    const excludedSeatRules = getExcludedSeatRules();
 
     for (let el of candidates) {
       const seatName = getSeatNameFromElement(el);
       if (normalizeSeatRowName(getSeatRowName(seatName)) !== rowClean) continue;
       rowFound = true;
 
+      if (isSeatExcluded(seatName, excludedSeatRules)) continue;
       if (isSeatOccupied(el) || clickedElements.has(el)) continue;
 
       clickSeatElement(el, seatName || rowName);
@@ -1289,6 +1988,8 @@
 
   function tryClickExactSeat(seatName) {
     const seatClean = normalizeSeatName(seatName);
+    const excludedSeatRules = getExcludedSeatRules();
+    if (isSeatExcluded(seatName, excludedSeatRules)) return 'occupied';
 
     const candidates = getSeatCandidates();
 
@@ -1296,6 +1997,7 @@
       const elSeat = normalizeSeatName(getSeatNameFromElement(el));
 
       if (elSeat !== seatClean) continue;
+      if (isSeatExcluded(getSeatNameFromElement(el), excludedSeatRules)) return 'occupied';
       if (isSeatOccupied(el)) return 'occupied';
       if (clickedElements.has(el)) return 'clicked';
 
@@ -1306,7 +2008,7 @@
     return 'not-found';
   }
 
-  function findFirstAvailableSeat(excludedSeats) {
+  function findFirstAvailableSeat(excludedSeats, excludedSeatRules = getExcludedSeatRules()) {
     const excluded = excludedSeats.map(normalizeSeatName);
     const seen = new Set();
 
@@ -1317,6 +2019,7 @@
       if (!isLikelySeatName(seatName) || excluded.includes(normalized) || seen.has(normalized)) continue;
       seen.add(normalized);
 
+      if (isSeatExcluded(seatName, excludedSeatRules)) continue;
       if (isSeatOccupied(el) || clickedElements.has(el)) continue;
       return { el, name: seatName };
     }
@@ -1398,7 +2101,7 @@
     scheduleDelayedClick(`seat-${normalizeSeatName(seatName)}`, STEP_DELAY_MS.seat, () => {
       debugLog('Clicking seat', seatName);
       dispatchClickSequence(clickableEl);
-      setTimeout(() => verifySeatClickResult(clickableEl, seatName, beforeSeatList), 1200);
+      setTimeout(() => verifySeatClickResult(clickableEl, seatName, beforeSeatList), 0);
     });
   }
 
@@ -1452,7 +2155,7 @@
     if (!bookNowButton) {
       if (attempt < 8) {
         debugLog('Book Now button not ready. Retrying', { attempt: attempt + 1 });
-        setTimeout(() => scheduleBookNowClick(attempt + 1), 500);
+        setTimeout(() => scheduleBookNowClick(attempt + 1), 0);
       } else {
         debugLog('Book Now button not found after seat selection');
       }
@@ -1520,7 +2223,7 @@
         });
         return false;
       }
-      sessionStorage.setItem(storageKey, String(now + delayMs + 500));
+      sessionStorage.setItem(storageKey, String(now + Math.max(delayMs, 0) + 500));
     } catch (err) {
       // Continue without scheduling lock if sessionStorage is unavailable.
     }
@@ -1535,7 +2238,7 @@
           // Ignore storage cleanup errors.
         }
       }
-    }, delayMs);
+    }, Math.max(delayMs, 0));
     return true;
   }
 
@@ -1674,4 +2377,11 @@
   } else {
     runAutomationCycle();
   }
+
+  function runAutomationCycleSoon() {
+    setTimeout(runAutomationCycle, 0);
+  }
+
+  window.addEventListener('hashchange', runAutomationCycleSoon);
+  window.addEventListener('popstate', runAutomationCycleSoon);
 })();
