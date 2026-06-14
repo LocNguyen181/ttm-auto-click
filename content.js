@@ -25,6 +25,7 @@
   let availabilityRefreshPending = false;
   let seatClickPending = false;
   let bookNowClickPending = false;
+  let enrollSubmitPending = false;
   let seatObserver = null;
   let lastVerifyClickAt = 0;
   let lastQueueRedirectAt = 0;
@@ -46,6 +47,20 @@
   const LAST_ZONE_CLICK_AT_KEY = 'ttmHelperLastZoneClickAt';
   const EVENT_ACTION_LOCK_KEY = 'ttmHelperEventActionLock';
   const EVENT_ACTION_LOCK_MS = 12000;
+
+  // In-memory booking state — chrome.storage.local is the persistence layer.
+  // localStorage/sessionStorage are NOT used for these because TTM's own page
+  // JavaScript clears them on page load, wiping the skipped-zone tracking.
+  let _skippedZones = [];
+  let _lastAttemptedZone = '';
+  let _pendingZoneAttempt = null;
+  let _zoneClickLogsHydrated = false;
+
+  // Keys managed internally — changes to these must not re-trigger runAutomationCycle.
+  const INTERNAL_STORAGE_KEYS = new Set([
+    SKIPPED_ZONES_KEY, LAST_ATTEMPTED_ZONE_KEY, PENDING_ZONE_ATTEMPT_KEY,
+    ZONE_CLICK_LOGS_KEY, LAST_ZONE_CLICK_AT_KEY
+  ]);
   const MAX_AVAILABILITY_WAIT_MS = 2500;
   const AVAILABILITY_WAIT_POLL_MS = 100;
   const ZONE_CLICK_VERIFY_MS = 250;
@@ -56,6 +71,7 @@
     event: 0,
     selectPerformance: 0,
     verify: 0,
+    enroll: 0,
     round: 0,
     availability: 0,
     zone: 0,
@@ -121,24 +137,48 @@
     };
   }
 
-  // Load settings
+  // Load settings and booking state together so automation never runs
+  // with a stale (or missing) skipped-zone list.
   chrome.storage.local.get(
     [
       'isActive', 'targetUrl', 'targetDate', 'targetTime',
       'zoneSelector', 'seatSelector', 'excludedZones', 'excludedSeats',
-      'autoNavigate', 'autoClick'
+      'autoNavigate', 'autoClick', 'fullname',
+      SKIPPED_ZONES_KEY, LAST_ATTEMPTED_ZONE_KEY, PENDING_ZONE_ATTEMPT_KEY,
+      ZONE_CLICK_LOGS_KEY, LAST_ZONE_CLICK_AT_KEY
     ],
     (result) => {
+      if (Array.isArray(result[SKIPPED_ZONES_KEY])) {
+        _skippedZones = result[SKIPPED_ZONES_KEY].map(normalizeZoneName).filter(Boolean);
+      }
+      _lastAttemptedZone = normalizeZoneName(result[LAST_ATTEMPTED_ZONE_KEY] || '').toUpperCase();
+      const pa = result[PENDING_ZONE_ATTEMPT_KEY];
+      if (pa && pa.zone && pa.startedAt) {
+        const zone = normalizeZoneName(pa.zone);
+        const startedAt = Number(pa.startedAt) || 0;
+        _pendingZoneAttempt = (zone && startedAt) ? { zone, startedAt } : null;
+      }
+
+      if (Array.isArray(result[ZONE_CLICK_LOGS_KEY])) {
+        zoneClickLogs = result[ZONE_CLICK_LOGS_KEY];
+      }
+      lastZoneClickAt = Number(result[LAST_ZONE_CLICK_AT_KEY]) || 0;
+      _zoneClickLogsHydrated = true;
+
       updateSettings(result);
     }
   );
 
-  // Monitor storage changes
+  // Monitor storage changes — skip internal keys so booking state writes
+  // (markZoneSkipped, persistPendingZoneAttempt, etc.) don't trigger
+  // runAutomationCycle as a side-effect.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local') {
       const newSettings = {};
       for (let key in changes) {
-        newSettings[key] = changes[key].newValue;
+        if (!INTERNAL_STORAGE_KEYS.has(key)) {
+          newSettings[key] = changes[key].newValue;
+        }
       }
       if (Object.keys(newSettings).length === 0) return;
       updateSettings(newSettings);
@@ -242,8 +282,10 @@
 
   function getHudPageLabel() {
     if (isSeatPage()) return 'Seat Selection';
+    if (isPaymentPage()) return 'Payment';
     if (isZoneSelectionPage()) return 'Zone Selection';
     if (isVerifyConditionPage()) return 'Verification';
+    if (isEnrollPage()) return 'Enroll';
     if (isQueueUrl(window.location.href)) return 'Queue';
     return 'Event / Other';
   }
@@ -358,8 +400,12 @@
       // On booking subdomain
       if (isVerifyConditionPage()) {
         handleVerifyCondition();
+      } else if (isEnrollPage()) {
+        handleEnrollPage();
       } else if (url.includes('seat') || url.includes('fixed.php')) {
         handleSeatSelection();
+      } else if (isPaymentPage()) {
+        handlePaymentPage();
       } else if (url.includes('zones.php') || document.querySelector('.map-zone') || document.getElementById('rdId')) {
         autoDetectAndStoreZones();
         handleBookingRoundAndZone();
@@ -466,6 +512,66 @@
     script.textContent = `(() => { ${code} })();`;
     (document.documentElement || document.head || document.body).appendChild(script);
     script.remove();
+  }
+
+  // ==================== PHASE 2.5: ENROLL PAGE (ENTER DETAILS) ====================
+  function isEnrollPage() {
+    return window.location.href.includes('enroll.php') && Boolean(document.getElementById('btn_regnow'));
+  }
+
+  function fillInput(el, value) {
+    if (!el) return;
+    el.focus();
+    // Use native setter so jQuery/vanilla validation listeners fire correctly
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    if (nativeSetter && nativeSetter.set) {
+      nativeSetter.set.call(el, value);
+    } else {
+      el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.blur();
+  }
+
+  function handleEnrollPage() {
+    if (!settings.isActive || !settings.autoClick) return;
+    if (!settings.fullname) return;
+    if (enrollSubmitPending) return;
+
+    const tryFillAndSubmit = () => {
+      const saveBtn = document.getElementById('btn_regnow');
+      if (!saveBtn || saveBtn.disabled || saveBtn.classList.contains('disabled')) return false;
+
+      const isSplitName = document.getElementById('isSplitName')?.value === '1';
+      if (isSplitName) {
+        const parts = settings.fullname.trim().split(/\s+/);
+        fillInput(document.getElementById('txt_firstname_0'), parts[0] || '');
+        fillInput(document.getElementById('txt_lastname_0'), parts.slice(1).join(' ') || '');
+      } else {
+        fillInput(document.getElementById('txt_fullname_0'), settings.fullname.trim());
+      }
+
+      enrollSubmitPending = true;
+      scheduleDelayedClick('enroll-save', STEP_DELAY_MS.enroll, () => {
+        enrollSubmitPending = false;
+        if (!isEnrollPage()) return;
+        const btn = document.getElementById('btn_regnow');
+        if (!btn) return;
+        btn.scrollIntoView({ block: 'center', inline: 'center' });
+        btn.click();
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        debugLog('Enroll form submitted', { fullname: settings.fullname });
+      });
+      return true;
+    };
+
+    if (!tryFillAndSubmit()) {
+      const observer = new MutationObserver(() => {
+        if (tryFillAndSubmit()) observer.disconnect();
+      });
+      observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    }
   }
 
   // ==================== PHASE 1: EVENT PAGE (SELECT PERFORMANCE) ====================
@@ -887,9 +993,14 @@
 
   function openAndReloadAvailability() {
     invalidateZoneDomCache();
-    const popupButton = document.getElementById('popup-avail');
-    if (popupButton && isVisible(popupButton)) {
-      dispatchClickSequence(popupButton);
+    // Only open the popup if the availability table is not already showing.
+    // Clicking a toggle-style popup button when it is already open would close
+    // it and make getCachedAvailabilityRows() work on stale hidden rows.
+    if (!hasAvailabilityTable()) {
+      const popupButton = document.getElementById('popup-avail');
+      if (popupButton && isVisible(popupButton)) {
+        dispatchClickSequence(popupButton);
+      }
     }
 
     runInPageContext(`
@@ -972,12 +1083,13 @@
 
     const tryZones = () => {
       const skippedZones = getSkippedZones();
+      const pendingAttempt = getPendingZoneAttempt();
       appendZoneClickLog('scan-state', 'zone-scan-state', {
         nextAction: 'try-zone-priorities',
         zonePriorities,
         skippedZones,
         excludedZones: [...excludedZones],
-        pendingAttempt: getPendingZoneAttempt(),
+        pendingAttempt,
         lastAttemptedZone: getLastAttemptedZone(),
         allowMapFallback,
         hasAvailabilityTable: hasAvailabilityTable(),
@@ -994,6 +1106,16 @@
 
         if (skippedZones.includes(normalizedZone)) {
           debugLog('Zone was already tried without seats. Skipping', zoneName);
+          continue;
+        }
+
+        // Safety net: if skippedZones storage failed, the pending attempt is a backup indicator
+        // that this zone was already clicked and navigated to (but found no seats).
+        if (pendingAttempt && pendingAttempt.zone === normalizedZone) {
+          debugLog('Zone has stale pending attempt on zone page. Marking as skipped.', zoneName);
+          markZoneSkipped(zoneName);
+          clearPendingZoneAttempt();
+          appendZoneClickLog(zoneName, 'pending-attempt-zone-page-skip', { nextAction: 'try-next-priority' });
           continue;
         }
 
@@ -1205,6 +1327,18 @@
     });
   }
 
+  function findLiveZoneElement(zoneName) {
+    const zoneClean = normalizeZoneName(zoneName);
+    const allCandidates = [
+      ...document.querySelectorAll('#avail_data table tbody tr, #popup-event-zone table tbody tr'),
+      ...document.querySelectorAll('.map-zone area[href], .select-zone area[href], map area[href], area'),
+    ];
+    for (const candidate of allCandidates) {
+      if (normalizeZoneName(getZoneNameFromElement(candidate)) === zoneClean) return candidate;
+    }
+    return null;
+  }
+
   function clickZoneElement(el, zoneName) {
     if (zoneClickPending) return;
     zoneClickPending = true;
@@ -1218,8 +1352,12 @@
     debugLog('Scheduling zone click', { zoneName, delayMs: STEP_DELAY_MS.zone });
     scheduleDelayedClick(`zone-${normalizeZoneName(zoneName)}`, STEP_DELAY_MS.zone, () => {
       debugLog('Clicking zone', zoneName);
-      el.click();
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      // Re-query the element before clicking in case the availability AJAX
+      // refreshed the DOM between when the element was captured and now,
+      // which would have detached `el` making the click ineffective.
+      const liveEl = document.contains(el) ? el : findLiveZoneElement(zoneName) || el;
+      liveEl.click();
+      liveEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
       appendZoneClickLog(zoneName, 'post-click-dispatched');
       setTimeout(() => verifyZoneClickResult(zoneName), ZONE_CLICK_VERIFY_MS);
     });
@@ -1347,31 +1485,16 @@
   }
 
   function hydrateZoneLogsFromStorage() {
-    try {
-      const rawLogs = sessionStorage.getItem(ZONE_CLICK_LOGS_KEY) || localStorage.getItem(ZONE_CLICK_LOGS_KEY) || '[]';
-      const parsedLogs = JSON.parse(rawLogs);
-      zoneClickLogs = Array.isArray(parsedLogs) ? parsedLogs : [];
-
-      const rawLastAt = sessionStorage.getItem(LAST_ZONE_CLICK_AT_KEY) || localStorage.getItem(LAST_ZONE_CLICK_AT_KEY) || '0';
-      lastZoneClickAt = Number(rawLastAt) || 0;
-    } catch (err) {
-      zoneClickLogs = [];
-      lastZoneClickAt = 0;
-    }
+    // Zone logs are now loaded from chrome.storage.local in the initial get
+    // callback (alongside settings). Nothing to do here unless that async load
+    // has not yet completed — in which case we start with an empty log and
+    // merge with storage once the callback fires.
   }
 
   function persistZoneLogsToStorage() {
-    try {
-      const logsJson = JSON.stringify(zoneClickLogs.slice(-500));
-      sessionStorage.setItem(ZONE_CLICK_LOGS_KEY, logsJson);
-      localStorage.setItem(ZONE_CLICK_LOGS_KEY, logsJson);
-
-      const lastAtValue = String(lastZoneClickAt || 0);
-      sessionStorage.setItem(LAST_ZONE_CLICK_AT_KEY, lastAtValue);
-      localStorage.setItem(LAST_ZONE_CLICK_AT_KEY, lastAtValue);
-    } catch (err) {
-      // Ignore storage write failures.
-    }
+    // Zone logs are persisted via persistZoneLogsToChromeStorage() only.
+    // localStorage/sessionStorage writes were removed because TTM's page JS
+    // clears them on navigation, causing log history to be lost.
   }
 
   function clearZoneLogsStorage() {
@@ -1393,8 +1516,80 @@
     });
   }
 
+  let paymentPageHandled = false;
+
+  function handlePaymentPage() {
+    if (paymentPageHandled) return;
+    paymentPageHandled = true;
+
+    // Defer to let TTM's jQuery finish binding handlers after DOM ready.
+    setTimeout(applyPaymentPageActions, 800);
+  }
+
+  function applyPaymentPageActions() {
+    // Uncheck Ticket Protect — has inline onclick="getTicketProtected(this)", native click works.
+    const ticketProtectCheckbox = findTicketProtectCheckbox();
+    if (ticketProtectCheckbox && ticketProtectCheckbox.checked) {
+      ticketProtectCheckbox.click();
+      debugLog('Payment: unchecked Ticket Protect', { id: ticketProtectCheckbox.id });
+    }
+
+    // Click "Pick up the ticket(s) by yourself" if not already the active selection.
+    // TTM's jQuery handler checks data-auto on the parent tab — remove the guard first.
+    const pickupBtn = document.getElementById('btn_pickup');
+    if (pickupBtn) {
+      const li = pickupBtn.closest('li');
+      if (!li || !li.classList.contains('active')) {
+        const tabDelivery = document.getElementById('tab-delivery');
+        if (tabDelivery) tabDelivery.setAttribute('data-auto', 'true');
+        pickupBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        debugLog('Payment: clicked btn_pickup');
+      }
+    }
+  }
+
+  function findTicketProtectCheckbox() {
+    // Known IDs used by TTM: ticket-protect-mobile, ticket-protect-desktop, etc.
+    const byId = document.querySelector(
+      'input[type="checkbox"][id*="ticket-protect"], input[type="checkbox"][id*="ticket_protect"]'
+    );
+    if (byId) return byId;
+
+    // Known name: check-protect
+    const byName = document.querySelector('input[type="checkbox"][name="check-protect"]');
+    if (byName) return byName;
+
+    // Fallback: find via label text containing "Ticket Protect".
+    for (const label of document.querySelectorAll('label')) {
+      if (/ticket\s*protect/i.test(label.textContent)) {
+        const forId = label.getAttribute('for');
+        if (forId) {
+          const el = document.getElementById(forId);
+          if (el && el.type === 'checkbox') return el;
+        }
+        const el = label.querySelector('input[type="checkbox"]');
+        if (el) return el;
+      }
+    }
+    return null;
+  }
+
+  function isPaymentPage() {
+    // Detect by known IDs first.
+    if (document.getElementById('btn_pickup')) return true;
+    if (document.getElementById('tab-delivery')) return true;
+    if (document.getElementById('btn_thaipost')) return true;
+
+    // Fallback: detect by "Pick up" + "by post" text blocks coexisting on page.
+    const bodyText = document.body?.textContent || '';
+    if (/pick\s*up.*ticket/i.test(bodyText) && /delivery.*ticket.*post/i.test(bodyText)) return true;
+
+    return false;
+  }
+
   function isZoneSelectionPage() {
     const url = window.location.href;
+    if (isPaymentPage()) return false;
     return url.includes('zones.php') ||
       Boolean(document.querySelector('.map-zone, .select-zone, map area')) ||
       Boolean(document.getElementById('rdId')) ||
@@ -1645,12 +1840,18 @@
       if (hasUntriedAvailableSeat()) return;
 
       const currentZone = getCurrentZoneName();
-      if (currentZone) {
-        markZoneSkipped(currentZone);
-        debugLog('No selectable seats in zone. Returning to zone selection', currentZone);
+      const pendingAttemptZone = !currentZone ? (getPendingZoneAttempt()?.zone || '') : '';
+      const zoneToSkip = currentZone || pendingAttemptZone;
+      if (zoneToSkip) {
+        markZoneSkipped(zoneToSkip);
+        appendZoneClickLog(zoneToSkip, 'no-seats-skip-zone', { nextAction: 'return-to-zone-selection' });
+        setHudZoneLog(zoneToSkip, 'no-seats');
+        debugLog('No selectable seats in zone. Returning to zone selection', zoneToSkip);
       } else {
+        appendZoneClickLog('unknown', 'no-seats-skip-zone', { nextAction: 'return-to-zone-selection' });
         debugLog('No selectable seats found. Returning to zone selection');
       }
+      clearPendingZoneAttempt();
 
       navigateBackToZoneSelection();
     }, SEAT_MAP_LOAD_TIMEOUT_MS);
@@ -1766,108 +1967,59 @@
   }
 
   function getSkippedZones() {
-    try {
-      const rawZones = localStorage.getItem(SKIPPED_ZONES_KEY) || sessionStorage.getItem(SKIPPED_ZONES_KEY) || '[]';
-      const zones = JSON.parse(rawZones);
-      return Array.isArray(zones) ? zones.map(normalizeZoneName).filter(Boolean) : [];
-    } catch (err) {
-      return [];
-    }
+    return [..._skippedZones];
   }
 
   function markZoneSkipped(zoneName) {
     const normalized = normalizeZoneName(zoneName);
     if (!normalized) return;
-
-    const zones = getSkippedZones();
-    if (!zones.includes(normalized)) zones.push(normalized);
-    localStorage.setItem(SKIPPED_ZONES_KEY, JSON.stringify(zones));
-    sessionStorage.setItem(SKIPPED_ZONES_KEY, JSON.stringify(zones));
-    debugLog('Marked zone as skipped', zones);
+    if (!_skippedZones.includes(normalized)) _skippedZones.push(normalized);
+    chrome.storage.local.set({ [SKIPPED_ZONES_KEY]: [..._skippedZones] });
+    debugLog('Marked zone as skipped', _skippedZones);
   }
 
   function clearSkippedZones() {
-    localStorage.removeItem(SKIPPED_ZONES_KEY);
-    sessionStorage.removeItem(SKIPPED_ZONES_KEY);
+    _skippedZones = [];
+    chrome.storage.local.remove([SKIPPED_ZONES_KEY]);
     clearLastAttemptedZone();
+    clearPendingZoneAttempt();
   }
 
   function hasActiveBookingAttempt() {
-    return Boolean(getSkippedZones().length > 0 || getLastAttemptedZone() || getPendingZoneAttempt());
+    return Boolean(_skippedZones.length > 0 || _lastAttemptedZone || _pendingZoneAttempt);
   }
 
   function persistLastAttemptedZone(zoneName) {
     const normalizedZone = normalizeZoneName(zoneName);
     if (!normalizedZone) return;
-
-    try {
-      localStorage.setItem(LAST_ATTEMPTED_ZONE_KEY, normalizedZone);
-      sessionStorage.setItem(LAST_ATTEMPTED_ZONE_KEY, normalizedZone);
-    } catch (err) {
-      // Ignore storage write failures.
-    }
+    _lastAttemptedZone = normalizedZone.toUpperCase();
+    chrome.storage.local.set({ [LAST_ATTEMPTED_ZONE_KEY]: _lastAttemptedZone });
   }
 
   function getLastAttemptedZone() {
-    try {
-      return normalizeZoneName(
-        localStorage.getItem(LAST_ATTEMPTED_ZONE_KEY) ||
-        sessionStorage.getItem(LAST_ATTEMPTED_ZONE_KEY) ||
-        ''
-      ).toUpperCase();
-    } catch (err) {
-      return '';
-    }
+    return _lastAttemptedZone;
   }
 
   function clearLastAttemptedZone() {
-    try {
-      localStorage.removeItem(LAST_ATTEMPTED_ZONE_KEY);
-      sessionStorage.removeItem(LAST_ATTEMPTED_ZONE_KEY);
-    } catch (err) {
-      // Ignore storage cleanup failures.
-    }
+    _lastAttemptedZone = '';
+    chrome.storage.local.remove([LAST_ATTEMPTED_ZONE_KEY]);
   }
 
   function persistPendingZoneAttempt(zoneName) {
     const normalizedZone = normalizeZoneName(zoneName);
     if (!normalizedZone) return;
-
-    const payload = JSON.stringify({
-      zone: normalizedZone,
-      startedAt: Date.now()
-    });
-    try {
-      localStorage.setItem(PENDING_ZONE_ATTEMPT_KEY, payload);
-      sessionStorage.setItem(PENDING_ZONE_ATTEMPT_KEY, payload);
-    } catch (err) {
-      // Ignore storage write failures.
-    }
-
+    _pendingZoneAttempt = { zone: normalizedZone, startedAt: Date.now() };
+    chrome.storage.local.set({ [PENDING_ZONE_ATTEMPT_KEY]: _pendingZoneAttempt });
     setTimeout(() => handlePendingZoneAttemptTimeout(), SEAT_MAP_LOAD_TIMEOUT_MS + AVAILABILITY_WAIT_POLL_MS);
   }
 
   function getPendingZoneAttempt() {
-    try {
-      const raw = sessionStorage.getItem(PENDING_ZONE_ATTEMPT_KEY) || localStorage.getItem(PENDING_ZONE_ATTEMPT_KEY) || '';
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      const zone = normalizeZoneName(parsed.zone || '');
-      const startedAt = Number(parsed.startedAt) || 0;
-      if (!zone || !startedAt) return null;
-      return { zone, startedAt };
-    } catch (err) {
-      return null;
-    }
+    return _pendingZoneAttempt;
   }
 
   function clearPendingZoneAttempt() {
-    try {
-      localStorage.removeItem(PENDING_ZONE_ATTEMPT_KEY);
-      sessionStorage.removeItem(PENDING_ZONE_ATTEMPT_KEY);
-    } catch (err) {
-      // Ignore storage cleanup failures.
-    }
+    _pendingZoneAttempt = null;
+    chrome.storage.local.remove([PENDING_ZONE_ATTEMPT_KEY]);
   }
 
   function handlePendingZoneAttemptTimeout() {

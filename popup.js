@@ -9,12 +9,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const seatSelectorInput = document.getElementById('seatSelector');
   const excludedZonesInput = document.getElementById('excludedZones');
   const excludedSeatsInput = document.getElementById('excludedSeats');
+  const fullnameInput = document.getElementById('fullname');
   
   const autoNavigateCheckbox = document.getElementById('autoNavigate');
   const autoClickCheckbox = document.getElementById('autoClick');
   const activeToggle = document.getElementById('activeToggle');
   const statusText = document.getElementById('statusText');
+  const NAV_LOG_KEY = 'ttmHelperNavLog';
   const downloadLogsBtn = document.getElementById('downloadLogsBtn');
+  const downloadNavLogBtn = document.getElementById('downloadNavLogBtn');
 
   const scanZonesBtn = document.getElementById('scanZonesBtn');
   const scannedZonesContainer = document.getElementById('scannedZonesContainer');
@@ -49,8 +52,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // Load saved configurations
   chrome.storage.local.get(
     [
-      'isActive', 
-      'targetUrl', 
+      'isActive',
+      'targetUrl',
       'targetDate',
       'targetTime',
       'zoneSelector',
@@ -58,8 +61,9 @@ document.addEventListener('DOMContentLoaded', () => {
       'seatSelector',
       'excludedZones',
       'excludedSeats',
-      'autoNavigate', 
-      'autoClick'
+      'autoNavigate',
+      'autoClick',
+      'fullname'
     ],
     (result) => {
       isActive = result.isActive || false;
@@ -73,6 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
       seatSelectorInput.value = result.seatSelector || '';
       excludedZonesInput.value = result.excludedZones || '';
       excludedSeatsInput.value = result.excludedSeats || '';
+      fullnameInput.value = result.fullname || '';
       
       autoNavigateCheckbox.checked = result.autoNavigate !== false;
       autoClickCheckbox.checked = result.autoClick !== false;
@@ -104,17 +109,19 @@ document.addEventListener('DOMContentLoaded', () => {
       excludedSeats: excludedSeatsInput.value.trim(),
       autoNavigate: autoNavigateCheckbox.checked,
       autoClick: autoClickCheckbox.checked,
+      fullname: fullnameInput.value.trim(),
     });
   }
 
   // Bind input events for auto-saving
   const inputsToSave = [
-    targetUrlInput, 
-    targetDateInput, 
-    targetTimeInput, 
+    targetUrlInput,
+    targetDateInput,
+    targetTimeInput,
     seatSelectorInput,
     excludedZonesInput,
-    excludedSeatsInput
+    excludedSeatsInput,
+    fullnameInput
   ];
   inputsToSave.forEach(input => input.addEventListener('input', saveSettings));
 
@@ -122,7 +129,6 @@ document.addEventListener('DOMContentLoaded', () => {
   autoClickCheckbox.addEventListener('change', saveSettings);
 
   function setActive(nextIsActive) {
-    const wasActive = isActive;
     isActive = nextIsActive;
     chrome.storage.local.set({ isActive }, () => {
       updateUI();
@@ -133,8 +139,6 @@ document.addEventListener('DOMContentLoaded', () => {
             chrome.tabs.update(tabs[0].id, { url: targetUrlInput.value.trim() });
           }
         });
-      } else if (wasActive && !isActive) {
-        downloadStoredZoneLogs();
       }
     });
   }
@@ -207,8 +211,48 @@ document.addEventListener('DOMContentLoaded', () => {
     return Object.keys(details).length > 0 ? JSON.stringify(details) : '';
   }
 
+  function downloadNavLog() {
+    chrome.storage.local.get([NAV_LOG_KEY], (result) => {
+      const entries = Array.isArray(result[NAV_LOG_KEY]) ? result[NAV_LOG_KEY] : [];
+      const lines = [
+        'TTM Helper Navigation Log',
+        `generated_at=${new Date().toISOString()}`,
+        `entries=${entries.length}`,
+        ''
+      ];
+
+      if (entries.length === 0) {
+        lines.push('No navigation events recorded. Make sure the extension was reloaded after the last update.');
+      } else {
+        entries.forEach((entry, index) => {
+          const parts = [
+            `${index + 1}.`,
+            `at=${entry.at || ''}`,
+            `type=${entry.type || ''}`,
+            `tabId=${entry.tabId ?? ''}`,
+            `transition=${entry.transitionType || ''}`,
+            `qualifiers=${entry.qualifiers || ''}`,
+            `error=${entry.error || ''}`,
+            `url=${entry.url || ''}`
+          ];
+          lines.push(parts.filter(p => !p.endsWith('=')).join(' | '));
+        });
+      }
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = objectUrl;
+      link.download = `ttm-helper-nav-log-${timestamp}.log`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    });
+  }
+
   activeToggle.addEventListener('change', () => setActive(activeToggle.checked));
   downloadLogsBtn.addEventListener('click', downloadLogsFromActiveTab);
+  downloadNavLogBtn.addEventListener('click', downloadNavLog);
 
   // Scan Zones from active tab
   scanZonesBtn.addEventListener('click', () => scanPageZones(false));

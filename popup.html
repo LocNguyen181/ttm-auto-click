@@ -113,11 +113,19 @@
         <input type="text" id="excludedSeats" placeholder="A1, A2, AA, B" autocomplete="off">
         <span class="help-text">Supports exact seats like A12 and whole rows like AA or B.</span>
       </div>
+
+      <div class="form-group">
+        <label for="fullname">Fullname on Ticket</label>
+        <input type="text" id="fullname" placeholder="Your full name in English" autocomplete="off">
+        <span class="help-text">Auto-filled on the enroll details page. Must match your ID document.</span>
+      </div>
     </div>
 
-    <div class="debug-actions">
+    <div class="debug-actions" style="display:none;">
       <button id="downloadLogsBtn" class="btn btn-secondary" type="button">Download Logs</button>
       <span class="help-text">Exports current zone logs without stopping the bot.</span>
+      <button id="downloadNavLogBtn" class="btn btn-secondary" type="button">Download Nav Log</button>
+      <span class="help-text">Exports all page navigations recorded by the service worker.</span>
     </div>
 
     <div class="footer">
