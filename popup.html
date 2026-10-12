@@ -119,13 +119,27 @@
         <input type="text" id="fullname" placeholder="Your full name in English" autocomplete="off">
         <span class="help-text">Auto-filled on the enroll details page. Must match your ID document.</span>
       </div>
+
+      <div class="form-group">
+        <label for="passportCountry">Passport Country</label>
+        <input type="text" id="passportCountry" placeholder="e.g. Vietnam" autocomplete="off">
+        <span class="help-text">Must match exactly the country name in the dropdown (e.g. Vietnam).</span>
+      </div>
+
+      <div class="form-group">
+        <label for="passportNumber">Passport Number</label>
+        <input type="text" id="passportNumber" placeholder="e.g. B1234567" autocomplete="off">
+        <span class="help-text">Auto-filled on the verify page. Selects Passport method automatically.</span>
+      </div>
     </div>
 
-    <div class="debug-actions" style="display:none;">
+    <div class="debug-actions">
       <button id="downloadLogsBtn" class="btn btn-secondary" type="button">Download Logs</button>
       <span class="help-text">Exports current zone logs without stopping the bot.</span>
       <button id="downloadNavLogBtn" class="btn btn-secondary" type="button">Download Nav Log</button>
       <span class="help-text">Exports all page navigations recorded by the service worker.</span>
+      <button id="downloadEventLogBtn" class="btn btn-secondary" type="button">Download Event Log</button>
+      <span class="help-text">Exports event page click diagnostics (what the bot saw and why it didn't click).</span>
     </div>
 
     <div class="footer">

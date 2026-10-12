@@ -10,14 +10,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const excludedZonesInput = document.getElementById('excludedZones');
   const excludedSeatsInput = document.getElementById('excludedSeats');
   const fullnameInput = document.getElementById('fullname');
-  
+  const passportCountryInput = document.getElementById('passportCountry');
+  const passportNumberInput = document.getElementById('passportNumber');
+
   const autoNavigateCheckbox = document.getElementById('autoNavigate');
   const autoClickCheckbox = document.getElementById('autoClick');
   const activeToggle = document.getElementById('activeToggle');
   const statusText = document.getElementById('statusText');
   const NAV_LOG_KEY = 'ttmHelperNavLog';
+  const EVENT_DEBUG_LOG_KEY = 'ttmHelperEventDebugLog';
   const downloadLogsBtn = document.getElementById('downloadLogsBtn');
   const downloadNavLogBtn = document.getElementById('downloadNavLogBtn');
+  const downloadEventLogBtn = document.getElementById('downloadEventLogBtn');
 
   const scanZonesBtn = document.getElementById('scanZonesBtn');
   const scannedZonesContainer = document.getElementById('scannedZonesContainer');
@@ -63,7 +67,9 @@ document.addEventListener('DOMContentLoaded', () => {
       'excludedSeats',
       'autoNavigate',
       'autoClick',
-      'fullname'
+      'fullname',
+      'passportCountry',
+      'passportNumber'
     ],
     (result) => {
       isActive = result.isActive || false;
@@ -78,7 +84,9 @@ document.addEventListener('DOMContentLoaded', () => {
       excludedZonesInput.value = result.excludedZones || '';
       excludedSeatsInput.value = result.excludedSeats || '';
       fullnameInput.value = result.fullname || '';
-      
+      passportCountryInput.value = result.passportCountry || '';
+      passportNumberInput.value = result.passportNumber || '';
+
       autoNavigateCheckbox.checked = result.autoNavigate !== false;
       autoClickCheckbox.checked = result.autoClick !== false;
 
@@ -97,7 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function saveSettings() {
+  function saveSettings(callback) {
     chrome.storage.local.set({
       targetUrl: targetUrlInput.value.trim(),
       targetDate: targetDateInput.value.trim(),
@@ -110,7 +118,9 @@ document.addEventListener('DOMContentLoaded', () => {
       autoNavigate: autoNavigateCheckbox.checked,
       autoClick: autoClickCheckbox.checked,
       fullname: fullnameInput.value.trim(),
-    });
+      passportCountry: passportCountryInput.value.trim(),
+      passportNumber: passportNumberInput.value.trim(),
+    }, callback);
   }
 
   // Bind input events for auto-saving
@@ -121,7 +131,9 @@ document.addEventListener('DOMContentLoaded', () => {
     seatSelectorInput,
     excludedZonesInput,
     excludedSeatsInput,
-    fullnameInput
+    fullnameInput,
+    passportCountryInput,
+    passportNumberInput
   ];
   inputsToSave.forEach(input => input.addEventListener('input', saveSettings));
 
@@ -132,13 +144,21 @@ document.addEventListener('DOMContentLoaded', () => {
     isActive = nextIsActive;
     chrome.storage.local.set({ isActive }, () => {
       updateUI();
-      saveSettings();
       if (isActive && autoNavigateCheckbox.checked && targetUrlInput.value.trim()) {
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-          if (tabs[0]) {
-            chrome.tabs.update(tabs[0].id, { url: targetUrlInput.value.trim() });
-          }
+        const target = targetUrlInput.value.trim();
+        // Save all settings first, then navigate — content script must read
+        // the complete settings (autoClick, targetDate, etc.) when it loads.
+        saveSettings(() => {
+          chrome.tabs.query({ url: '*://*.thaiticketmajor.com/*' }, (ttmTabs) => {
+            if (ttmTabs.length > 0) {
+              chrome.tabs.update(ttmTabs[0].id, { url: target, active: true });
+            } else {
+              chrome.tabs.create({ url: target });
+            }
+          });
         });
+      } else {
+        saveSettings();
       }
     });
   }
@@ -250,9 +270,43 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function downloadEventLog() {
+    chrome.storage.session.get([EVENT_DEBUG_LOG_KEY], (result) => {
+      const entries = Array.isArray(result[EVENT_DEBUG_LOG_KEY]) ? result[EVENT_DEBUG_LOG_KEY] : [];
+      const lines = [
+        'TTM Helper Event Page Debug Log',
+        `generated_at=${new Date().toISOString()}`,
+        `entries=${entries.length}`,
+        ''
+      ];
+
+      if (entries.length === 0) {
+        lines.push('No event debug entries recorded yet.');
+      } else {
+        entries.forEach((entry, index) => {
+          lines.push(`--- ${index + 1}. at=${entry.at} | url=${entry.url}`);
+          lines.push(`    readyState=${entry.readyState} | visibleCandidates=${entry.visibleCandidates} | targetDate=${entry.targetDate} | targetTime=${entry.targetTime}`);
+          (entry.elements || []).forEach(el => {
+            lines.push(`    [${el.tag}] text="${el.text}" | class="${el.class}" | href="${el.href}" | onclick="${el.onclick}"`);
+          });
+        });
+      }
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      link.href = objectUrl;
+      link.download = `ttm-helper-event-log-${timestamp}.log`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    });
+  }
+
   activeToggle.addEventListener('change', () => setActive(activeToggle.checked));
   downloadLogsBtn.addEventListener('click', downloadLogsFromActiveTab);
   downloadNavLogBtn.addEventListener('click', downloadNavLog);
+  downloadEventLogBtn.addEventListener('click', downloadEventLog);
 
   // Scan Zones from active tab
   scanZonesBtn.addEventListener('click', () => scanPageZones(false));

@@ -2,6 +2,12 @@
   const DEFAULT_CLICK_SELECTOR = '.btn-buynow, .btn-item a.btn, a.btn-buynow, a.btn-red[href*="booking"], a[href*="/booking/"]';
   const SCRIPT_INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
+  // chrome.storage.session is available in content scripts only from Chrome 112+.
+  // Fall back to chrome.storage.local so the bot runs on older versions too.
+  const sessionStore = (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.session)
+    ? chrome.storage.session
+    : chrome.storage.local;
+
   let settings = {
     isActive: false,
     targetUrl: '',
@@ -12,7 +18,9 @@
     excludedZones: '', // comma-separated zones to never select
     excludedSeats: '', // comma-separated seat names or rows to never select
     autoNavigate: true,
-    autoClick: true
+    autoClick: true,
+    passportCountry: '',
+    passportNumber: ''
   };
 
   const clickedElements = new WeakSet();
@@ -41,20 +49,24 @@
   let cachedMapAreas = null;
   let cachedMapZoneCandidates = null;
   const SKIPPED_ZONES_KEY = 'ttmHelperSkippedZones';
+  const SKIPPED_ZONE_TTL_MS = 10 * 60 * 1000;
   const LAST_ATTEMPTED_ZONE_KEY = 'ttmHelperLastAttemptedZone';
   const PENDING_ZONE_ATTEMPT_KEY = 'ttmHelperPendingZoneAttempt';
   const ZONE_CLICK_LOGS_KEY = 'ttmHelperZoneClickLogs';
   const LAST_ZONE_CLICK_AT_KEY = 'ttmHelperLastZoneClickAt';
   const EVENT_ACTION_LOCK_KEY = 'ttmHelperEventActionLock';
+  const EVENT_DEBUG_LOG_KEY = 'ttmHelperEventDebugLog';
+  const MAX_EVENT_DEBUG_ENTRIES = 200;
   const EVENT_ACTION_LOCK_MS = 12000;
 
   // In-memory booking state — chrome.storage.local is the persistence layer.
   // localStorage/sessionStorage are NOT used for these because TTM's own page
   // JavaScript clears them on page load, wiping the skipped-zone tracking.
-  let _skippedZones = [];
+  let _skippedZones = []; // [{zone: string, skippedAt: number}] — in-memory cache, persisted to chrome.storage.session
   let _lastAttemptedZone = '';
   let _pendingZoneAttempt = null;
   let _zoneClickLogsHydrated = false;
+  let _isNavigatingBack = false; // guard: prevent multiple simultaneous navigateBackToZoneSelection calls
 
   // Keys managed internally — changes to these must not re-trigger runAutomationCycle.
   const INTERNAL_STORAGE_KEYS = new Set([
@@ -66,7 +78,7 @@
   const ZONE_CLICK_VERIFY_MS = 250;
   const ZONE_SEAT_MAP_WAIT_MS = 2500;
   const SEAT_MAP_LOAD_TIMEOUT_MS = 3000;
-  const ENABLE_CONSOLE_LOGS = false;
+  const ENABLE_CONSOLE_LOGS = true;
   const STEP_DELAY_MS = {
     event: 0,
     selectPerformance: 0,
@@ -143,14 +155,11 @@
     [
       'isActive', 'targetUrl', 'targetDate', 'targetTime',
       'zoneSelector', 'seatSelector', 'excludedZones', 'excludedSeats',
-      'autoNavigate', 'autoClick', 'fullname',
-      SKIPPED_ZONES_KEY, LAST_ATTEMPTED_ZONE_KEY, PENDING_ZONE_ATTEMPT_KEY,
+      'autoNavigate', 'autoClick', 'fullname', 'passportCountry', 'passportNumber',
+      LAST_ATTEMPTED_ZONE_KEY, PENDING_ZONE_ATTEMPT_KEY,
       ZONE_CLICK_LOGS_KEY, LAST_ZONE_CLICK_AT_KEY
     ],
     (result) => {
-      if (Array.isArray(result[SKIPPED_ZONES_KEY])) {
-        _skippedZones = result[SKIPPED_ZONES_KEY].map(normalizeZoneName).filter(Boolean);
-      }
       _lastAttemptedZone = normalizeZoneName(result[LAST_ATTEMPTED_ZONE_KEY] || '').toUpperCase();
       const pa = result[PENDING_ZONE_ATTEMPT_KEY];
       if (pa && pa.zone && pa.startedAt) {
@@ -158,14 +167,24 @@
         const startedAt = Number(pa.startedAt) || 0;
         _pendingZoneAttempt = (zone && startedAt) ? { zone, startedAt } : null;
       }
-
       if (Array.isArray(result[ZONE_CLICK_LOGS_KEY])) {
         zoneClickLogs = result[ZONE_CLICK_LOGS_KEY];
       }
       lastZoneClickAt = Number(result[LAST_ZONE_CLICK_AT_KEY]) || 0;
       _zoneClickLogsHydrated = true;
 
-      updateSettings(result);
+      // Load skipped zones from session storage last — automation must not start
+      // until _skippedZones is hydrated, otherwise bot ignores previously skipped zones.
+      sessionStore.get([SKIPPED_ZONES_KEY], (sessionResult) => {
+        if (Array.isArray(sessionResult[SKIPPED_ZONES_KEY])) {
+          const now = Date.now();
+          _skippedZones = sessionResult[SKIPPED_ZONES_KEY]
+            .filter(e => e && e.zone && (now - (e.skippedAt || 0)) < SKIPPED_ZONE_TTL_MS)
+            .map(e => ({ zone: normalizeZoneName(e.zone), skippedAt: e.skippedAt }))
+            .filter(e => e.zone);
+        }
+        updateSettings(result);
+      });
     }
   );
 
@@ -192,13 +211,17 @@
   });
 
   hydrateZoneLogsFromStorage();
+  // Remove any legacy skipped-zones entry left in local storage — state now lives in session storage.
+  chrome.storage.local.remove([SKIPPED_ZONES_KEY]);
 
   function updateSettings(newSettings) {
     for (let key in newSettings) {
       if (newSettings[key] === undefined) delete newSettings[key];
     }
     settings = { ...settings, ...newSettings };
-    debugLog('Settings updated', getSettingsDebugInfo());
+    const debugInfo = getSettingsDebugInfo();
+    debugLog('Settings updated', debugInfo);
+    appendEventDebugLog({ at: new Date().toISOString(), event: 'settings-updated', url: window.location.href, settings: debugInfo });
     updateHud();
 
     if (settings.isActive) {
@@ -318,9 +341,22 @@
       };
 
       if (cleanUrl(currentUrl) !== cleanUrl(targetUrl)) {
-        if (!currentUrl.includes('booking.thaiticketmajor.com')) {
+        const onBookingSubdomain = currentUrl.includes('booking.thaiticketmajor.com');
+        if (!onBookingSubdomain) {
           debugLog('Navigating to target URL', targetUrl);
           window.location.href = targetUrl;
+        } else {
+          // On booking subdomain: only navigate away if we're on the wrong event's zones page.
+          const targetQuery = getTargetEventQuery();
+          if (targetQuery && currentUrl.includes('zones.php')) {
+            try {
+              const curQuery = new URL(currentUrl).searchParams.get('query');
+              if (curQuery && curQuery !== targetQuery) {
+                debugLog('On wrong event zones page, navigating to target URL', { curQuery, targetQuery, targetUrl });
+                window.location.href = targetUrl;
+              }
+            } catch (e) { /* ignore */ }
+          }
         }
       }
     } catch (err) {
@@ -344,7 +380,33 @@
   function handleQueuePage() {
     if (!isQueueUrl(window.location.href)) return false;
 
+    const tryConfirmRedirectDialog = () => {
+      const modal = document.getElementById('divConfirmRedirectModal');
+      if (!modal) return false;
+
+      const modalStyle = getComputedStyle(modal);
+      const isShowing = modal.style.display !== 'none' &&
+        !modal.hidden &&
+        modalStyle.display !== 'none' &&
+        modalStyle.visibility !== 'hidden';
+      if (!isShowing) return false;
+
+      const btn = document.getElementById('buttonConfirmRedirect');
+      if (!btn) return false;
+
+      debugLog('Queue confirm redirect dialog detected. Auto-clicking Yes');
+      btn.click();
+      btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      runInPageContext(`
+        const btn = document.getElementById('buttonConfirmRedirect');
+        if (btn) btn.click();
+      `);
+      return true;
+    };
+
     const tryQueueRedirect = () => {
+      tryConfirmRedirectDialog();
+
       const queueTargetUrl = getQueueReadyTargetUrl();
       if (!queueTargetUrl || Date.now() - lastQueueRedirectAt < 1500) return;
 
@@ -355,11 +417,23 @@
 
     tryQueueRedirect();
 
+    const confirmObserver = new MutationObserver(() => {
+      if (!settings.isActive) { confirmObserver.disconnect(); return; }
+      tryConfirmRedirectDialog();
+    });
+    confirmObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class', 'hidden']
+    });
+
     if (!queueRetryTimer) {
       queueRetryTimer = setInterval(() => {
         if (!settings.isActive || !isQueueUrl(window.location.href)) {
           clearInterval(queueRetryTimer);
           queueRetryTimer = null;
+          confirmObserver.disconnect();
           return;
         }
         tryQueueRedirect();
@@ -398,7 +472,9 @@
 
     if (url.includes('booking.thaiticketmajor.com')) {
       // On booking subdomain
-      if (isVerifyConditionPage()) {
+      if (isVerifyPage()) {
+        handleVerifyPage();
+      } else if (isVerifyConditionPage()) {
         handleVerifyCondition();
       } else if (isEnrollPage()) {
         handleEnrollPage();
@@ -421,6 +497,81 @@
         }
         runEventPageClicker();
       }
+    }
+  }
+
+  // ==================== PASSPORT VERIFY PAGE (verify.php) ====================
+  function isVerifyPage() {
+    return (
+      window.location.href.includes('verify.php') &&
+      Boolean(document.querySelector('.verify-method-btn[data-method="passport"]'))
+    );
+  }
+
+  let verifyPageHandled = false;
+  let verifyPageHandledUrl = '';
+
+  function handleVerifyPage() {
+    if (!settings.isActive || !settings.passportNumber) return;
+    if (verifyPageHandled && verifyPageHandledUrl === window.location.href) return;
+
+    const tryVerifyPage = () => {
+      const passportBtn = document.querySelector('.verify-method-btn[data-method="passport"]');
+      if (!passportBtn) return false;
+
+      if (!passportBtn.classList.contains('active')) {
+        debugLog('Verify page: clicking Passport method button');
+        passportBtn.click();
+        passportBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        setTimeout(tryVerifyPage, 300);
+        return true;
+      }
+
+      if (settings.passportCountry) {
+        const countryHidden = document.getElementById('passport_country');
+        const countryInput = document.getElementById('passport_country_input');
+        if (countryHidden && !countryHidden.value) {
+          const targetName = settings.passportCountry.trim().toLowerCase();
+          const option = [...document.querySelectorAll('#passport_country_dropdown .verify-country-option')]
+            .find(el => el.getAttribute('data-name')?.toLowerCase() === targetName ||
+                        el.textContent.trim().toLowerCase() === targetName);
+          if (option) {
+            countryHidden.value = option.getAttribute('data-code') || '';
+            fillInput(countryInput, option.getAttribute('data-name') || option.textContent.trim());
+            option.click();
+            debugLog('Verify page: selected passport country', settings.passportCountry);
+          }
+        }
+      }
+
+      const passportInput = document.getElementById('txt_verifycode');
+      if (!passportInput) return false;
+      if (passportInput.value !== settings.passportNumber) {
+        fillInput(passportInput, settings.passportNumber);
+        debugLog('Verify page: filled passport number');
+      }
+
+      const submitBtn = document.getElementById('btnconfirm');
+      if (!submitBtn || submitBtn.disabled) return false;
+
+      verifyPageHandled = true;
+      verifyPageHandledUrl = window.location.href;
+      debugLog('Verify page: submitting form');
+      submitBtn.click();
+      submitBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return true;
+    };
+
+    if (!tryVerifyPage()) {
+      const observer = new MutationObserver(() => {
+        if (tryVerifyPage()) observer.disconnect();
+      });
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style']
+      });
     }
   }
 
@@ -846,16 +997,41 @@
     }
   }
 
+  function appendEventDebugLog(entry) {
+    sessionStore.get([EVENT_DEBUG_LOG_KEY], (result) => {
+      const log = Array.isArray(result[EVENT_DEBUG_LOG_KEY]) ? result[EVENT_DEBUG_LOG_KEY] : [];
+      log.push(entry);
+      if (log.length > MAX_EVENT_DEBUG_ENTRIES) log.splice(0, log.length - MAX_EVENT_DEBUG_ENTRIES);
+      sessionStore.set({ [EVENT_DEBUG_LOG_KEY]: log });
+    });
+  }
+
   function logEventNoMatch(visibleCandidates) {
     if (Date.now() - lastEventNoMatchLogAt < 2500) return;
     lastEventNoMatchLogAt = Date.now();
-    debugLog('No matching event round/button found yet', {
+
+    const candidates = [...document.querySelectorAll('a, button')]
+      .filter(el => isVisible(el))
+      .slice(0, 20)
+      .map(el => ({
+        tag: el.tagName,
+        text: (el.textContent || '').trim().slice(0, 60),
+        href: (el.getAttribute('href') || '').slice(0, 80),
+        class: (typeof el.className === 'string' ? el.className : '').slice(0, 60),
+        onclick: (el.getAttribute('onclick') || '').slice(0, 60)
+      }));
+
+    const entry = {
+      at: new Date().toISOString(),
+      url: window.location.href,
       readyState: document.readyState,
       visibleCandidates,
       targetDate: settings.targetDate,
       targetTime: settings.targetTime,
-      pageTextSample: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 500)
-    });
+      elements: candidates
+    };
+    appendEventDebugLog(entry);
+    debugLog('No matching event round/button found yet', entry);
   }
 
   function isTooFrequentVerificationPage() {
@@ -1926,21 +2102,36 @@
   }
 
   function navigateBackToZoneSelection() {
-    const zoneLink = document.querySelector('a[href*="zones.php"]');
-    if (zoneLink && zoneLink.href) {
-      window.location.href = zoneLink.href;
+    if (_isNavigatingBack) {
+      debugLog('navigateBackToZoneSelection: already navigating, ignoring duplicate call');
       return;
     }
+    _isNavigatingBack = true;
 
+    // Priority 1: build URL from current page state or targetUrl setting (most reliable — avoids wrong-event links on page)
     const zoneSelectionUrl = buildZoneSelectionUrl();
     if (zoneSelectionUrl) {
       window.location.href = zoneSelectionUrl;
       return;
     }
 
+    // Priority 2: find a zones.php link on the page that matches the target event query
+    const targetQuery = getTargetEventQuery();
+    if (targetQuery) {
+      const matchingLink = [...document.querySelectorAll('a[href*="zones.php"]')]
+        .find(a => {
+          try { return new URL(a.href).searchParams.get('query') === targetQuery; } catch (e) { return false; }
+        });
+      if (matchingLink) {
+        window.location.href = matchingLink.href;
+        return;
+      }
+    }
+
     window.history.back();
   }
 
+  // Returns the event query ID from the current page URL, payment form, or target URL setting.
   function buildZoneSelectionUrl() {
     try {
       const currentUrl = new URL(window.location.href);
@@ -1959,34 +2150,56 @@
         const rdIdSuffix = rdId ? `&rdId=${encodeURIComponent(rdId)}` : '';
         return `/booking/3m/zones.php?query=${encodeURIComponent(query)}${rdIdSuffix}`;
       }
+
+      // Fallback: extract query from the user-configured target URL
+      const targetQuery = getTargetEventQuery();
+      if (targetQuery) {
+        return `/booking/3m/zones.php?query=${encodeURIComponent(targetQuery)}`;
+      }
     } catch (err) {
-      // Fall through to browser history when page metadata is not available.
+      // Fall through.
     }
 
     return '';
   }
 
+  // Extracts the event query ID from settings.targetUrl (e.g. "query=464" → "464").
+  function getTargetEventQuery() {
+    try {
+      if (!settings.targetUrl) return '';
+      const url = new URL(settings.targetUrl, 'https://booking.thaiticketmajor.com');
+      return url.searchParams.get('query') || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   function getSkippedZones() {
-    return [..._skippedZones];
+    const now = Date.now();
+    return _skippedZones
+      .filter(e => (now - e.skippedAt) < SKIPPED_ZONE_TTL_MS)
+      .map(e => e.zone);
   }
 
   function markZoneSkipped(zoneName) {
     const normalized = normalizeZoneName(zoneName);
     if (!normalized) return;
-    if (!_skippedZones.includes(normalized)) _skippedZones.push(normalized);
-    chrome.storage.local.set({ [SKIPPED_ZONES_KEY]: [..._skippedZones] });
-    debugLog('Marked zone as skipped', _skippedZones);
+    const now = Date.now();
+    _skippedZones = _skippedZones.filter(e => (now - e.skippedAt) < SKIPPED_ZONE_TTL_MS && e.zone !== normalized);
+    _skippedZones.push({ zone: normalized, skippedAt: now });
+    sessionStore.set({ [SKIPPED_ZONES_KEY]: [..._skippedZones] });
+    debugLog('Marked zone as skipped', _skippedZones.map(e => e.zone));
   }
 
   function clearSkippedZones() {
     _skippedZones = [];
-    chrome.storage.local.remove([SKIPPED_ZONES_KEY]);
+    sessionStore.remove([SKIPPED_ZONES_KEY]);
     clearLastAttemptedZone();
     clearPendingZoneAttempt();
   }
 
   function hasActiveBookingAttempt() {
-    return Boolean(_skippedZones.length > 0 || _lastAttemptedZone || _pendingZoneAttempt);
+    return Boolean(getSkippedZones().length > 0 || _lastAttemptedZone || _pendingZoneAttempt);
   }
 
   function persistLastAttemptedZone(zoneName) {
