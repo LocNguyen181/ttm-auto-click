@@ -2,7 +2,8 @@ const NAV_LOG_KEY = 'ttmHelperNavLog';
 const MAX_NAV_LOG_ENTRIES = 500;
 
 function appendNavEntry(entry) {
-  chrome.storage.local.get([NAV_LOG_KEY], (result) => {
+  chrome.storage.local.get(['isActive', NAV_LOG_KEY], (result) => {
+    if (result.isActive !== true) return;
     const log = Array.isArray(result[NAV_LOG_KEY]) ? result[NAV_LOG_KEY] : [];
     log.push(entry);
     if (log.length > MAX_NAV_LOG_ENTRIES) {

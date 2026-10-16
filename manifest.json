@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "ThaiTicketMajor Helper",
-  "version": "1.1",
-  "description": "Auto-navigate and auto-click helper for ThaiTicketMajor.",
+  "version": "2.0",
+  "description": "Seat-map helper for ThaiTicketMajor: auto-picks a seat and clicks Book Now once the seat map is open.",
   "permissions": [
     "storage",
     "activeTab",
-    "scripting",
     "webNavigation",
     "tabs"
   ],
