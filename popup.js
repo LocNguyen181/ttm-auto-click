@@ -18,6 +18,13 @@ document.addEventListener('DOMContentLoaded', () => {
     updateUI();
   });
 
+  // The content script switches itself off after a seat is selected.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !('isActive' in changes)) return;
+    isActive = changes.isActive.newValue === true;
+    updateUI();
+  });
+
   function updateUI() {
     activeToggle.checked = isActive;
     statusText.textContent = isActive ? 'Active' : 'Inactive';

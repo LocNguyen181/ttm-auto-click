@@ -332,6 +332,7 @@
       } else {
         appendLog('book-now-not-found', { nextAction: 'wait-for-user' });
         setHudMessage('Book Now button not found');
+        autoStop('seat-selected-book-now-not-found');
       }
       return;
     }
@@ -341,6 +342,19 @@
     appendLog('book-now-clicked');
     setHudMessage('Book Now clicked');
     dispatchPointerClickSequence(bookNowButton);
+    autoStop('seat-selected-book-now-clicked');
+  }
+
+  // Once a seat is held the job is done: switch the tool off so it does not
+  // pick another seat on the next seat map the user opens.
+  function autoStop(reason) {
+    if (!settings.isActive) return;
+    settings = { ...settings, isActive: false };
+    debugLog('Auto-stopped after seat selection', reason);
+    appendLog('auto-stopped', { reason, nextAction: 'none' });
+    setHudMessage('Seat done. Tool stopped');
+    stopWatching();
+    chrome.storage.local.set({ isActive: false });
   }
 
   function findBookNowButton() {

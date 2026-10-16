@@ -50,3 +50,13 @@ test('content log download reports empty logs instead of exporting a blank file'
   assert.match(contentJs, /return \{ ok: false, error: 'empty-log', logCount: 0 \};/);
   assert.match(contentJs, /script_instance=\$\{entry\.scriptInstanceId/);
 });
+
+test('tool switches itself off once a seat is selected and Book Now is handled', () => {
+  const start = contentJs.indexOf('function scheduleBookNowClick');
+  const end = contentJs.indexOf('\n  function findBookNowButton', start);
+  const block = contentJs.slice(start, end);
+  assert.ok(block.indexOf('dispatchPointerClickSequence(bookNowButton)') < block.indexOf("autoStop('seat-selected-book-now-clicked')"),
+    'Book Now must be clicked before the tool stops');
+  assert.match(block, /autoStop\('seat-selected-book-now-not-found'\)/);
+  assert.match(block, /function autoStop[\s\S]*chrome\.storage\.local\.set\(\{ isActive: false \}\)/);
+});
